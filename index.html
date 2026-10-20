@@ -1,0 +1,3061 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#A8DC78">
+<link rel="icon" href="data:,">
+<title>Loop Garden</title>
+<meta name="description" content="Run circles around grumpy blobs to turn them into flowers. A wordless one-finger adventure: 18 garden rooms and an endless arena.">
+<meta property="og:title" content="Loop Garden">
+<meta property="og:description" content="Run circles around grumpy blobs to turn them into flowers. A wordless one-finger adventure.">
+<meta property="og:image" content="https://extenup.github.io/loop-garden-game/cover-1280x720.png">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #A8DC78; overscroll-behavior: none; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #safe { position: fixed; visibility: hidden; pointer-events: none; padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
+</style>
+</head>
+<body>
+<div id="safe"></div>
+<canvas id="game" aria-label="Loop Garden: run circles around grumpy blobs to turn them into flowers, help friends, reach the sun door"></canvas>
+<script>
+// Loop Garden — deterministic rules engine (no DOM). Exposes globalThis.LG.
+(function (G) {
+  'use strict';
+  const LG = G.LG || (G.LG = {});
+
+  const C = LG.CONST = {
+    DT: 1 / 120,
+    PLAYER_R: 16,
+    SPEED: 255,
+    ACCEL: 2400,
+    TRAIL_STEP: 7,
+    TRAIL_MAX: 1250,
+    MIN_LOOP_AREA: 3400,
+    MIN_LOOP_WIDTH: 24, // 2*area/perimeter (mean width); rejects thin back-and-forth slivers
+    CLOSE_R: 22,
+    CLOSE_BACK: 160, // ribbon length that must separate the two touching points
+    TRAIL_IDLE: 1.2, // standing still this long lets the ribbon fade
+    TRAIL_AGE: 10, // ribbon older than this fades even while drifting slowly
+    RESPAWN_TIME: 0.7,
+    INVULN: 1.1,
+    PICK_R: 30,
+    GIVE_R: 60,
+    FOLLOW_GAP: 34,
+    HINT_IDLE: 6,
+    DIZZY_ROOM: 34, // spare px a dizzy dasher leaves beside walls beyond the hero's own width
+    SHRINK_STUN: 0.8, // a big grump shrunk by its first loop stands dazed this long before chasing
+    // endless arena
+    ARENA_SAFE: 260, // grumps never appear closer than this to the hero
+    ARENA_WARN: 0.9, // seconds a spawn ring is shown before the grump appears
+    ARENA_INV: 1.2, // invulnerability after a hit
+    ARENA_KNOCK: 60, // knock-back distance after a hit
+    ARENA_KNOCK_T: 0.2, // ...spread over this long (eases out, input ignored meanwhile)
+    HEART_EVERY: 25, // a heart appears this long after the hero got hurt (while not at full hp)
+  };
+
+  // ---------- geometry ----------
+  function segX(ax, ay, bx, by, cx, cy, dx, dy) {
+    const rx = bx - ax, ry = by - ay, sx = dx - cx, sy = dy - cy;
+    const den = rx * sy - ry * sx;
+    if (Math.abs(den) < 1e-9) return null;
+    const qx = cx - ax, qy = cy - ay;
+    const t = (qx * sy - qy * sx) / den;
+    const u = (qx * ry - qy * rx) / den;
+    if (t <= 0 || t > 1 || u < 0 || u > 1) return null;
+    return { t, u, x: ax + rx * t, y: ay + ry * t };
+  }
+  function polyArea(p) {
+    let a = 0;
+    for (let i = 0, j = p.length - 1; i < p.length; j = i++) a += (p[j].x + p[i].x) * (p[j].y - p[i].y);
+    return Math.abs(a / 2);
+  }
+  function inPoly(x, y, p) {
+    let ins = false;
+    for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+      const a = p[i], b = p[j];
+      if ((a.y > y) !== (b.y > y) && x < ((b.x - a.x) * (y - a.y)) / (b.y - a.y) + a.x) ins = !ins;
+    }
+    return ins;
+  }
+  function circRect(cx, cy, r, R) {
+    const nx = Math.max(R.x, Math.min(cx, R.x + R.w));
+    const ny = Math.max(R.y, Math.min(cy, R.y + R.h));
+    const dx = cx - nx, dy = cy - ny;
+    return dx * dx + dy * dy < r * r;
+  }
+  function pushOut(e, r, R) {
+    const nx = Math.max(R.x, Math.min(e.x, R.x + R.w));
+    const ny = Math.max(R.y, Math.min(e.y, R.y + R.h));
+    let dx = e.x - nx, dy = e.y - ny;
+    const d2 = dx * dx + dy * dy;
+    if (d2 >= r * r) return false;
+    if (d2 > 1e-6) {
+      const d = Math.sqrt(d2), k = (r - d) / d;
+      e.x += dx * k; e.y += dy * k;
+      if (Math.abs(dx) > Math.abs(dy)) e.vx = 0; else e.vy = 0;
+    } else {
+      // centre inside rect: push along shortest axis
+      const l = e.x - R.x, rr = R.x + R.w - e.x, t = e.y - R.y, b = R.y + R.h - e.y;
+      const m = Math.min(l, rr, t, b);
+      if (m === l) e.x = R.x - r; else if (m === rr) e.x = R.x + R.w + r;
+      else if (m === t) e.y = R.y - r; else e.y = R.y + R.h + r;
+    }
+    return true;
+  }
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  LG.geo = { segX, polyArea, inPoly, circRect, pushOut, dist };
+
+  // ---------- seeded rng ----------
+  function rng(seed) {
+    let s = seed >>> 0 || 1;
+    return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  }
+  // rng whose whole state lives in S.rs (a plain number), so arena states snapshot/replay exactly
+  function rnd(S) {
+    S.rs = (Math.imul(S.rs, 1664525) + 1013904223) >>> 0;
+    return S.rs / 4294967296;
+  }
+
+  // ---------- level instantiation ----------
+  function makeState(levelIndex) {
+    const L = LG.LEVELS[levelIndex];
+    const S = {
+      li: levelIndex, W: L.w, H: L.h, t: 0, rand: rng(1234 + levelIndex * 97),
+      player: { x: L.start.x, y: L.start.y, vx: 0, vy: 0, carry: null, dead: 0, inv: 0, face: 1, moving: 0 },
+      check: { x: L.start.x, y: L.start.y },
+      trail: [], trailLen: 0,
+      walls: L.walls.map((r) => ({ ...r })),
+      thorns: (L.thorns || []).map((r) => ({ ...r })),
+      water: (L.water || []).map((w) => ({ ...w, bridged: false })),
+      enemies: (L.enemies || []).map((e, i) => mkEnemy(e, i)),
+      buds: (L.buds || []).map((b) => ({ ...b, open: false, anim: 0 })),
+      cages: (L.cages || []).map((c) => ({ ...c, open: false, anim: 0 })),
+      items: (L.items || []).map((it) => ({ ...it, hx: it.x, hy: it.y, taken: false, used: false })),
+      npcs: (L.npcs || []).map((n) => ({ ...n, done: false, joy: 0 })),
+      followers: (L.followers || []).map((f) => ({ ...f, hx: f.x, hy: f.y, on: false, home: false, scared: 0 })),
+      doors: (L.doors || []).map((d) => ({ ...d, open: false, anim: 0 })),
+      lanterns: (L.lanterns || []).map((l) => ({ ...l, lit: false })),
+      sparkles: (L.sparkles || []).map((s) => ({ ...s, got: false })),
+      gate: { ...L.gate, open: false, anim: 0 },
+      exit: { ...L.exit },
+      won: false, wonT: 0, winAt: 0, hurts: 0, loops: 0, bestCombo: 0,
+      idle: 0, lastProgress: 0, path: [],
+    };
+    return S;
+  }
+  function mkEnemy(e, i) {
+    const base = { kind: 'sleepy', r: 21, speed: 70, alive: true, pop: 0, id: i, required: true, st: 'idle', tm: 0, pi: 1, dir: 1, vx: 0, vy: 0 };
+    const o = Object.assign(base, e);
+    if (o.kind === 'big') o.r = e.r || 36;
+    o.hx = o.x; o.hy = o.y;
+    return o;
+  }
+  LG.makeState = makeState;
+
+  // tasks shown on the exit gate (the arena has none: it never ends in a win)
+  function tasks(S) {
+    const out = [];
+    if (S.arena) return out;
+    for (const e of S.enemies) if (e.required) out.push({ kind: 'enemy', sub: e.kind, done: !e.alive, ref: e });
+    for (const n of S.npcs) out.push({ kind: 'npc', sub: n.who, done: n.done, ref: n });
+    for (const c of S.cages) if (c.task) out.push({ kind: 'cage', sub: c.who, done: c.open, ref: c });
+    return out;
+  }
+  LG.tasks = tasks;
+
+  // ---------- blocking geometry ----------
+  function blockers(S, forEnemy) {
+    const b = S.walls.slice();
+    for (const w of S.water) {
+      if (!w.bridged || !w.bridge) b.push(w);
+      else if (w.bridge.x1 !== undefined) {
+        b.push({ x: w.x, y: w.y, w: w.bridge.x1 - w.x, h: w.h });
+        b.push({ x: w.bridge.x2, y: w.y, w: w.x + w.w - w.bridge.x2, h: w.h });
+      } else {
+        b.push({ x: w.x, y: w.y, w: w.w, h: w.bridge.y1 - w.y });
+        b.push({ x: w.x, y: w.bridge.y2, w: w.w, h: w.y + w.h - w.bridge.y2 });
+      }
+    }
+    for (const d of S.doors) if (!d.open) b.push(d);
+    if (!S.gate.open) b.push(S.gate);
+    for (const c of S.cages) if (!c.open) b.push({ x: c.x - 26, y: c.y - 26, w: 52, h: 52 });
+    if (forEnemy) b.push(...S.thorns);
+    return b;
+  }
+  function collide(S, e, r, forEnemy) {
+    const bl = blockers(S, forEnemy);
+    let hit = false;
+    for (let k = 0; k < 2; k++) for (const R of bl) if (R.w > 0 && R.h > 0 && pushOut(e, r, R)) hit = true;
+    if (e.x < r) { e.x = r; hit = true; } if (e.y < r) { e.y = r; hit = true; }
+    if (e.x > S.W - r) { e.x = S.W - r; hit = true; } if (e.y > S.H - r) { e.y = S.H - r; hit = true; }
+    return hit;
+  }
+
+  // ---------- trail & loops ----------
+  // a closed ribbon counts as a loop only if it is big enough and not a thin sliver
+  function loopShapeOk(poly) {
+    const a = polyArea(poly);
+    if (a < C.MIN_LOOP_AREA) return false;
+    let per = 0;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) per += Math.hypot(poly[i].x - poly[j].x, poly[i].y - poly[j].y);
+    return (2 * a) / per >= C.MIN_LOOP_WIDTH;
+  }
+  function clearTrail(S) { S.trail = []; S.trailLen = 0; }
+  function addTrail(S, ev) {
+    const p = S.player, tr = S.trail;
+    const last = tr[tr.length - 1];
+    if (last && Math.hypot(p.x - last.x, p.y - last.y) < C.TRAIL_STEP) return;
+    const np = { x: p.x, y: p.y, t: S.t };
+    if (last) {
+      // test the new segment against older segments (skip the newest few)
+      for (let i = tr.length - 4; i >= 0; i--) {
+        const a = tr[i], b = tr[i + 1];
+        const h = segX(last.x, last.y, np.x, np.y, a.x, a.y, b.x, b.y);
+        if (!h) continue;
+        const poly = [{ x: h.x, y: h.y }];
+        for (let j = i + 1; j < tr.length; j++) poly.push(tr[j]);
+        poly.push({ x: h.x, y: h.y });
+        if (loopShapeOk(poly)) { closeLoop(S, poly, ev); return; }
+        break;
+      }
+      // forgiving close: touching an older part of the ribbon also closes the loop
+      let back = 0;
+      for (let i = tr.length - 1; i > 0; i--) {
+        back += Math.hypot(tr[i].x - tr[i - 1].x, tr[i].y - tr[i - 1].y);
+        if (back < C.CLOSE_BACK) continue;
+        const q = tr[i - 1];
+        if (Math.hypot(q.x - np.x, q.y - np.y) < C.CLOSE_R) {
+          const poly = tr.slice(i - 1).concat([np]);
+          if (loopShapeOk(poly)) { closeLoop(S, poly, ev); return; }
+        }
+      }
+      S.trailLen += Math.hypot(np.x - last.x, np.y - last.y);
+    }
+    tr.push(np);
+    while (S.trailLen > (S.trailMax || C.TRAIL_MAX) && tr.length > 2) {
+      S.trailLen -= Math.hypot(tr[1].x - tr[0].x, tr[1].y - tr[0].y);
+      tr.shift();
+    }
+  }
+  function closeLoop(S, poly, ev) {
+    S.loops++;
+    let caught = 0, popped = 0, sx = 0, sy = 0;
+    const got = (x, y) => { caught++; sx += x; sy += y; };
+    for (const e of S.enemies) if (e.alive && inPoly(e.x, e.y, poly)) {
+      if (e.kind === 'big' && !e.shrunk) {
+        // a big grump needs two loops: the first shrinks it into a fast, angry chaser
+        // it is stunned for a moment first (st 'dizzy', no new event), so it cannot bump a hero standing
+        // where the loop closed before they can react
+        e.shrunk = true; e.r = 22; e.speed = Math.max(e.speed, 80); e.range = Math.max(e.range || 0, 260); got(e.x, e.y);
+        e.stun = C.SHRINK_STUN; e.st = 'dizzy'; e.tm = 0;
+        ev.push({ t: 'shrink', x: e.x, y: e.y });
+        continue;
+      }
+      e.alive = false; e.pop = 1; popped++; got(e.x, e.y);
+      ev.push({ t: 'pop', x: e.x, y: e.y, kind: e.kind });
+    }
+    for (const b of S.buds) if (!b.open && inPoly(b.x, b.y, poly)) {
+      b.open = true; got(b.x, b.y);
+      const w = S.water.find((q) => q.id === b.water);
+      if (w) w.bridged = true;
+      ev.push({ t: 'bloom', x: b.x, y: b.y });
+    }
+    for (const c of S.cages) if (!c.open && inPoly(c.x, c.y, poly)) {
+      c.open = true; got(c.x, c.y);
+      ev.push({ t: 'free', x: c.x, y: c.y, who: c.who });
+      if (c.releases) { const f = S.followers.find((q) => q.id === c.releases); if (f) f.free = true; }
+    }
+    const cx = poly.reduce((s, q) => s + q.x, 0) / poly.length, cy = poly.reduce((s, q) => s + q.y, 0) / poly.length;
+    ev.push({ t: 'loop', poly: poly.map((q) => ({ x: q.x, y: q.y })), caught, x: cx, y: cy });
+    // one loop, several catches: a combo, centred on what it caught
+    if (caught >= 2) {
+      ev.push({ t: 'combo', n: caught, x: sx / caught, y: sy / caught });
+      if (caught > S.bestCombo) S.bestCombo = caught;
+    }
+    // arena score: n grumps in one loop are worth n*n
+    if (S.arena && popped) { S.arena.score += popped * popped; S.arena.kills += popped; }
+    if (caught) S.lastProgress = S.t;
+    clearTrail(S);
+  }
+  function trailHits(S, x, y, r) {
+    const tr = S.trail;
+    for (let i = 0; i < tr.length - 1; i++) {
+      const a = tr[i], b = tr[i + 1];
+      const vx = b.x - a.x, vy = b.y - a.y, L2 = vx * vx + vy * vy || 1;
+      let t = ((x - a.x) * vx + (y - a.y) * vy) / L2; t = Math.max(0, Math.min(1, t));
+      const dx = a.x + vx * t - x, dy = a.y + vy * t - y;
+      if (dx * dx + dy * dy < r * r) return i;
+    }
+    return -1;
+  }
+
+  // ---------- enemies ----------
+  // distance from (x, y) to the nearest thing that blocks enemies (walls, water, thorns, room edge)
+  function clearance(S, x, y) {
+    let m = Math.min(x, y, S.W - x, S.H - y);
+    for (const R of blockers(S, true)) {
+      if (R.w <= 0 || R.h <= 0) continue;
+      const dx = Math.max(R.x - x, 0, x - (R.x + R.w)), dy = Math.max(R.y - y, 0, y - (R.y + R.h));
+      m = Math.min(m, Math.hypot(dx, dy));
+    }
+    return m;
+  }
+  // after a charge, pick where the dizzy dasher settles: back along its charge until the hero has room
+  // to walk all the way around it (a dasher pinned to a wall could never be looped)
+  function recoilSpot(S, e) {
+    const need = e.r + 2 * C.PLAYER_R + C.DIZZY_ROOM;
+    let best = { x: e.x, y: e.y, c: clearance(S, e.x, e.y) };
+    const back = Math.hypot(e.x - e.sx, e.y - e.sy);
+    for (let s = 4; best.c < need && s <= back + 2; s += 4) {
+      const k = Math.min(s, back), x = e.x - e.dx * k, y = e.y - e.dy * k, c = clearance(S, x, y);
+      if (c > best.c) best = { x, y, c };
+    }
+    return best;
+  }
+  function moveEnemy(S, e, dt, ev) {
+    const p = S.player;
+    const alivePlayer = !p.dead;
+    e.tm += dt;
+    if (e.stun > 0) { e.stun = Math.max(0, e.stun - dt); return; }
+    let tx = null, ty = null, sp = e.speed;
+    switch (e.kind) {
+      case 'sleepy': return;
+      case 'wander': case 'cutter': {
+        const path = e.path;
+        const tgt = path[e.pi];
+        tx = tgt.x; ty = tgt.y;
+        if (Math.hypot(tx - e.x, ty - e.y) < 6) {
+          if (e.loop) e.pi = (e.pi + 1) % path.length;
+          else { if (e.pi + e.dir >= path.length || e.pi + e.dir < 0) e.dir *= -1; e.pi += e.dir; }
+        }
+        break;
+      }
+      case 'chaser': case 'big': {
+        const d = Math.hypot(p.x - e.x, p.y - e.y);
+        const range = e.range || 230;
+        if (alivePlayer && d < range && Math.hypot(e.x - e.hx, e.y - e.hy) < (e.leash || 360)) { tx = p.x; ty = p.y; e.st = 'chase'; }
+        else { tx = e.hx; ty = e.hy; e.st = 'home'; sp *= 0.7; }
+        break;
+      }
+      case 'dasher': {
+        const d = Math.hypot(p.x - e.x, p.y - e.y);
+        if (e.st === 'idle') {
+          if (alivePlayer && d < (e.range || 280) && e.tm > 0.4) { e.st = 'wind'; e.tm = 0; e.ax = p.x - e.x; e.ay = p.y - e.y; ev.push({ t: 'wind', x: e.x, y: e.y }); }
+          else if (e.stalk && alivePlayer) { tx = p.x; ty = p.y; sp = e.stalk; } // arena dashers creep toward the hero
+          else { tx = e.hx; ty = e.hy; sp = 40; }
+        } else if (e.st === 'wind') {
+          e.ax = p.x - e.x; e.ay = p.y - e.y;
+          if (e.tm > 0.75) { const L = Math.hypot(e.ax, e.ay) || 1; e.dx = e.ax / L; e.dy = e.ay / L; e.sx = e.x; e.sy = e.y; e.st = 'dash'; e.tm = 0; ev.push({ t: 'dash', x: e.x, y: e.y }); }
+          return;
+        } else if (e.st === 'dash') {
+          const bx = e.x, by = e.y;
+          e.x += e.dx * 470 * dt; e.y += e.dy * 470 * dt;
+          const hit = collide(S, e, e.r, true);
+          if (hit || e.tm > 0.85 || Math.hypot(e.x - bx, e.y - by) < 470 * dt * 0.3) {
+            e.st = 'dizzy'; e.tm = 0; ev.push({ t: 'bonk', x: e.x, y: e.y, hard: hit });
+            const r = recoilSpot(S, e);
+            if (Math.hypot(r.x - e.x, r.y - e.y) > 1) { e.rx = r.x; e.ry = r.y; }
+          }
+          return;
+        } else if (e.st === 'dizzy') {
+          if (e.rx !== undefined) {
+            // bounce back into open space; the dizzy timer starts once it has settled
+            const dx = e.rx - e.x, dy = e.ry - e.y, L = Math.hypot(dx, dy), s = Math.min(L, 420 * dt);
+            const ox = e.x, oy = e.y;
+            if (L > 0.5) { e.x += (dx / L) * s; e.y += (dy / L) * s; collide(S, e, e.r, true); }
+            // settled, or blocked on the way back (never leave it sliding forever)
+            if (L - s <= 0.5 || Math.hypot(e.x - ox, e.y - oy) < s * 0.3) e.rx = e.ry = undefined;
+            e.tm = 0;
+            return;
+          }
+          if (e.tm > (e.dizzy || 1.8)) { e.st = 'idle'; e.tm = 0; }
+          return;
+        }
+        break;
+      }
+    }
+    if (tx === null) return;
+    const dx = tx - e.x, dy = ty - e.y, L = Math.hypot(dx, dy);
+    if (L > 1) {
+      const s = Math.min(L, sp * dt);
+      e.x += (dx / L) * s; e.y += (dy / L) * s;
+      e.vx = dx / L; e.vy = dy / L;
+    }
+    collide(S, e, e.r, true);
+  }
+
+  // ---------- main step ----------
+  function hurt(S, ev, why) {
+    const p = S.player;
+    if (p.dead || p.inv > 0 || S.won) return;
+    p.dead = C.RESPAWN_TIME; S.hurts++;
+    ev.push({ t: 'hurt', x: p.x, y: p.y, why });
+    clearTrail(S);
+    for (const e of S.enemies) if (e.kind === 'dasher' && e.alive) { e.st = 'idle'; e.tm = 0; e.x = e.hx; e.y = e.hy; e.rx = e.ry = undefined; }
+    for (const e of S.enemies) if ((e.kind === 'chaser' || e.kind === 'big') && e.alive) { e.x = e.hx; e.y = e.hy; }
+  }
+
+  // steering, walls, ribbon growth/fading and follower path memory (shared by rooms and the arena)
+  function movePlayer(S, input, dt, ev) {
+    const p = S.player;
+    let mx = input.mx || 0, my = input.my || 0;
+    const m = Math.hypot(mx, my);
+    if (m > 1) { mx /= m; my /= m; }
+    const tvx = mx * C.SPEED, tvy = my * C.SPEED;
+    const a = C.ACCEL * dt;
+    p.vx += Math.max(-a, Math.min(a, tvx - p.vx));
+    p.vy += Math.max(-a, Math.min(a, tvy - p.vy));
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    collide(S, p, C.PLAYER_R, false);
+    const sp = Math.hypot(p.vx, p.vy);
+    p.moving = sp;
+    if (S.clock0 == null && sp > 20) S.clock0 = S.t; // the sun clock starts with the first step
+    if (Math.abs(p.vx) > 8) p.face = p.vx > 0 ? 1 : -1;
+    if (sp > 20) { S.idle = 0; addTrail(S, ev); } else S.idle += dt;
+    // stale ribbon fades: standing still, or ribbon older than TRAIL_AGE (slow drifting)
+    if (S.trail.length && S.idle >= C.TRAIL_IDLE) { clearTrail(S); ev.push({ t: 'fade', x: p.x, y: p.y }); }
+    const tr = S.trail;
+    while (tr.length > 1 && S.t - tr[0].t > C.TRAIL_AGE) { S.trailLen -= Math.hypot(tr[1].x - tr[0].x, tr[1].y - tr[0].y); tr.shift(); }
+    if (tr.length === 1 && S.t - tr[0].t > C.TRAIL_AGE) clearTrail(S);
+    // path memory for followers
+    const lp = S.path[0];
+    if (!lp || Math.hypot(lp.x - p.x, lp.y - p.y) > 4) { S.path.unshift({ x: p.x, y: p.y }); if (S.path.length > 120) S.path.pop(); }
+  }
+  // a snipper touching the ribbon drops everything older than the cut
+  function snip(S, e, ev) {
+    if (e.kind !== 'cutter' || S.trail.length < 2) return;
+    const i = trailHits(S, e.x, e.y, e.r + 3);
+    if (i < 0) return;
+    ev.push({ t: 'snip', x: e.x, y: e.y });
+    S.trail = S.trail.slice(i + 1);
+    S.trailLen = 0;
+    for (let k = 1; k < S.trail.length; k++) S.trailLen += dist(S.trail[k], S.trail[k - 1]);
+  }
+
+  function step(S, input, dt, ev) {
+    if (S.arena) return arenaStep(S, input, dt, ev);
+    S.t += dt;
+    const p = S.player;
+    if (S.won) { S.wonT += dt; return; }
+    if (p.inv > 0) p.inv -= dt;
+    if (p.dead > 0) {
+      p.dead -= dt;
+      if (p.dead <= 0) { p.dead = 0; p.x = S.check.x; p.y = S.check.y; p.vx = p.vy = 0; p.inv = C.INVULN; ev.push({ t: 'spawn', x: p.x, y: p.y }); }
+    } else movePlayer(S, input, dt, ev);
+
+    // enemies
+    for (const e of S.enemies) {
+      if (!e.alive) { if (e.pop > 0) e.pop = Math.max(0, e.pop - dt * 1.6); continue; }
+      moveEnemy(S, e, dt, ev);
+      if (!p.dead && Math.hypot(p.x - e.x, p.y - e.y) < C.PLAYER_R + e.r - 5) hurt(S, ev, 'enemy');
+      snip(S, e, ev);
+      for (const f of S.followers) if (f.on && Math.hypot(f.x - e.x, f.y - e.y) < e.r + 14) {
+        // the chick hops a short way back from the grump and waits there to be collected again
+        const ax = f.x - e.x, ay = f.y - e.y, aL = Math.hypot(ax, ay) || 1;
+        f.hx = Math.max(20, Math.min(S.W - 20, f.x + (ax / aL) * 80)); f.hy = Math.max(20, Math.min(S.H - 20, f.y + (ay / aL) * 80));
+        f.on = false; f.scared = 1.2; ev.push({ t: 'scared', x: f.x, y: f.y });
+      }
+    }
+    if (!p.dead) for (const R of S.thorns) if (circRect(p.x, p.y, C.PLAYER_R - 4, R)) { hurt(S, ev, 'thorn'); break; }
+
+    if (!p.dead) {
+      // lanterns
+      for (const l of S.lanterns) if (!l.lit && Math.hypot(p.x - l.x, p.y - l.y) < 40) {
+        for (const o of S.lanterns) o.lit = false;
+        l.lit = true; S.check = { x: l.x, y: l.y + 34 }; ev.push({ t: 'lantern', x: l.x, y: l.y });
+      }
+      // sparkles
+      for (const s of S.sparkles) if (!s.got && Math.hypot(p.x - s.x, p.y - s.y) < 28) { s.got = true; ev.push({ t: 'sparkle', x: s.x, y: s.y }); }
+      // items
+      if (!p.carry) for (const it of S.items) if (!it.taken && !it.used && Math.hypot(p.x - it.x, p.y - it.y) < C.PICK_R) {
+        it.taken = true; p.carry = it; S.lastProgress = S.t; ev.push({ t: 'pick', x: it.x, y: it.y, kind: it.kind }); break;
+      }
+      // doors with locks
+      for (const d of S.doors) if (!d.open && p.carry && p.carry.kind === d.lock && circRect(p.x, p.y, C.PLAYER_R + 18, d)) {
+        d.open = true; p.carry.used = true; p.carry = null; S.lastProgress = S.t; ev.push({ t: 'unlock', x: d.x + d.w / 2, y: d.y + d.h / 2 });
+      }
+      // npcs
+      for (const n of S.npcs) {
+        if (n.done) continue;
+        const near = Math.hypot(p.x - n.x, p.y - n.y) < C.GIVE_R;
+        if (n.want && p.carry && p.carry.kind === n.want && near) {
+          n.done = true; n.joy = 1; p.carry.used = true; p.carry = null; S.lastProgress = S.t;
+          ev.push({ t: 'give', x: n.x, y: n.y, who: n.who });
+          reward(S, n, ev);
+        } else if (near && !n.wantFollower && (!p.carry || p.carry.kind !== n.want) && !S.followers.some((f) => f.on && f.kind === n.want)) {
+          if (!n.nudge || S.t - n.nudge > 1.5) { n.nudge = S.t; ev.push({ t: 'ask', x: n.x, y: n.y }); }
+        }
+      }
+    }
+    // followers
+    for (const f of S.followers) {
+      if (f.home) continue;
+      if (f.scared > 0) {
+        f.scared -= dt;
+        const dx = f.hx - f.x, dy = f.hy - f.y, L = Math.hypot(dx, dy);
+        if (L > 2) { const s = Math.min(L, 320 * dt); f.x += (dx / L) * s; f.y += (dy / L) * s; }
+        continue;
+      }
+      if (!f.on) {
+        const dx = f.hx - f.x, dy = f.hy - f.y, L = Math.hypot(dx, dy);
+        if (L > 2) { const s = Math.min(L, 200 * dt); f.x += (dx / L) * s; f.y += (dy / L) * s; }
+        if (!p.dead && (f.free !== false) && Math.hypot(p.x - f.x, p.y - f.y) < 75) { f.on = true; S.lastProgress = S.t; ev.push({ t: 'follow', x: f.x, y: f.y }); }
+      } else {
+        const tgt = S.path[Math.min(S.path.length - 1, 9)] || p;
+        const dx = tgt.x - f.x, dy = tgt.y - f.y, L = Math.hypot(dx, dy);
+        if (L > C.FOLLOW_GAP * 0.4) { const s = Math.min(L, 300 * dt); f.x += (dx / L) * s; f.y += (dy / L) * s; }
+        // delivered when the follower reaches the npc, or when the hero stands at the npc with it in tow
+        // (it trails ~50px behind, so requiring the follower itself to touch felt unresponsive)
+        for (const n of S.npcs) if (!n.done && n.want === f.kind && (Math.hypot(f.x - n.x, f.y - n.y) < 60 ||
+          (!p.dead && Math.hypot(p.x - n.x, p.y - n.y) < C.GIVE_R && Math.hypot(f.x - p.x, f.y - p.y) < 110))) {
+          n.done = true; n.joy = 1; f.on = false; f.home = true; f.x = n.x + 30; f.y = n.y + 14; S.lastProgress = S.t;
+          ev.push({ t: 'give', x: n.x, y: n.y, who: n.who });
+          reward(S, n, ev);
+        }
+      }
+    }
+    // gate
+    if (!S.gate.open && tasks(S).every((q) => q.done)) { S.gate.open = true; ev.push({ t: 'gate', x: S.gate.x + S.gate.w / 2, y: S.gate.y + S.gate.h / 2 }); }
+    if (S.gate.open && !p.dead && Math.hypot(p.x - S.exit.x, p.y - S.exit.y) < 36) { S.won = true; S.winAt = S.t; ev.push({ t: 'win', x: S.exit.x, y: S.exit.y }); }
+  }
+  function reward(S, n, ev) {
+    if (n.opens) { const d = S.doors.find((q) => q.id === n.opens); if (d) { d.open = true; ev.push({ t: 'unlock', x: d.x + d.w / 2, y: d.y + d.h / 2 }); } }
+    if (n.bridges) { const w = S.water.find((q) => q.id === n.bridges); if (w) { w.bridged = true; ev.push({ t: 'bloom', x: n.x, y: n.y }); } }
+  }
+
+  // next hint target for ghost guidance
+  function hintTarget(S) {
+    const p = S.player;
+    if (p.carry) {
+      const n = S.npcs.find((q) => !q.done && q.want === p.carry.kind);
+      if (n) return { kind: 'go', x: n.x, y: n.y };
+      const d = S.doors.find((q) => !q.open && q.lock === p.carry.kind);
+      if (d) return { kind: 'go', x: d.x + d.w / 2, y: d.y + d.h / 2 };
+    }
+    const f = S.followers.find((q) => q.on);
+    if (f) { const n = S.npcs.find((q) => !q.done && q.want === f.kind); if (n) return { kind: 'go', x: n.x, y: n.y }; }
+    const cand = [];
+    // optional grumps (snippers) are never hinted: they are hazards to work around
+    for (const e of S.enemies) if (e.alive && e.required !== false) cand.push({ kind: 'loop', x: e.x, y: e.y, r: e.r });
+    for (const b of S.buds) if (!b.open) cand.push({ kind: 'loop', x: b.x, y: b.y, r: 18 });
+    for (const c of S.cages) if (!c.open) cand.push({ kind: 'loop', x: c.x, y: c.y, r: 26 });
+    for (const it of S.items) if (!it.taken && !it.used) cand.push({ kind: 'go', x: it.x, y: it.y });
+    for (const fo of S.followers) if (!fo.on && !fo.home && fo.free !== false) cand.push({ kind: 'go', x: fo.x, y: fo.y });
+    if (S.gate.open) return { kind: 'go', x: S.exit.x, y: S.exit.y };
+    let best = null, bd = 1e9;
+    for (const q of cand) { const d = Math.hypot(q.x - p.x, q.y - p.y); if (d < bd) { bd = d; best = q; } }
+    return best && best.kind === 'loop' ? loopHint(S, best, cand) : best;
+  }
+  // A loop hint covers the whole huddle its target belongs to (things closer together than the hero can
+  // slip between are caught together), and widens to take along a snipper whose round circles it, as far
+  // as the ribbon length allows. Same shape as any loop target: ring radius in the UI is r + 62.
+  function loopHint(S, best, cand) {
+    const loops = cand.filter((q) => q.kind === 'loop');
+    const grp = [best];
+    for (let i = 0; i < grp.length; i++) for (const q of loops) {
+      if (!grp.includes(q) && Math.hypot(q.x - grp[i].x, q.y - grp[i].y) < q.r + grp[i].r + 2 * C.PLAYER_R - 10) grp.push(q);
+    }
+    const x = grp.reduce((s, q) => s + q.x, 0) / grp.length, y = grp.reduce((s, q) => s + q.y, 0) / grp.length;
+    let r = Math.max(...grp.map((q) => Math.hypot(q.x - x, q.y - y) + q.r));
+    const cap = (C.TRAIL_MAX * 0.85) / (2 * Math.PI) - 62;
+    for (const e of S.enemies) if (e.alive && e.kind === 'cutter' && e.path && inPoly(x, y, e.path)) {
+      r = Math.max(r, Math.min(cap, Math.max(...e.path.map((q) => Math.hypot(q.x - x, q.y - y))) + e.r));
+    }
+    return { kind: 'loop', x, y, r };
+  }
+  LG.hintTarget = hintTarget;
+
+  // ---------- endless arena ----------
+  // a pinwheel of four hedges round an open middle (a free circle of ~255 px around the start leaves
+  // room for big loops) and two thorn patches by the top and bottom edges
+  const ARENA = {
+    W: 1000, H: 1000, start: { x: 500, y: 500 },
+    walls: [
+      { x: 170, y: 240, w: 180, h: 32 }, { x: 730, y: 170, w: 32, h: 180 },
+      { x: 650, y: 728, w: 180, h: 32 }, { x: 238, y: 650, w: 32, h: 180 },
+    ],
+    thorns: [{ x: 466, y: 84, w: 68, h: 56 }, { x: 466, y: 860, w: 68, h: 56 }],
+  };
+  LG.ARENA = ARENA;
+  // each kind joins on its wave (and is introduced alone on that wave): sleepy → wander → chaser → cutter → dasher → big
+  const UNLOCK = { sleepy: 1, wander: 3, chaser: 5, cutter: 8, dasher: 11, big: 14 };
+  LG.ARENA_UNLOCK = UNLOCK;
+  const radiusOf = (kind) => (kind === 'big' ? 36 : 21);
+  // quick opening: a sleepy trio hatches ~1.3 s in, wave 2 follows ~5 s later
+  const waveGap = (w) => Math.max(3.2, 5.2 - 0.15 * w); // seconds between waves
+  const waveCap = (w) => Math.min(12, 3 + w); // grumps alive + announced
+
+  function makeArena(seed) {
+    const s0 = (seed >>> 0) || 1;
+    const S = {
+      li: -1, W: ARENA.W, H: ARENA.H, t: 0, rs: ((s0 ^ 0x9e3779b9) >>> 0) || 1,
+      player: { x: ARENA.start.x, y: ARENA.start.y, vx: 0, vy: 0, carry: null, dead: 0, inv: 0, face: 1, moving: 0, kb: 0, kbx: 0, kby: 0 },
+      check: { x: ARENA.start.x, y: ARENA.start.y },
+      trail: [], trailLen: 0,
+      walls: ARENA.walls.map((r) => ({ ...r })),
+      thorns: ARENA.thorns.map((r) => ({ ...r })),
+      water: [], enemies: [], buds: [], cages: [], items: [], npcs: [], followers: [], doors: [], lanterns: [], sparkles: [],
+      // no exit here: a closed gate parked far outside the room keeps the state shape
+      gate: { x: -2000, y: -2000, w: 120, h: 36, open: false, anim: 0 },
+      exit: { x: -1940, y: -2080 },
+      won: false, wonT: 0, winAt: 0, hurts: 0, loops: 0, bestCombo: 0,
+      idle: 0, lastProgress: 0, path: [],
+      arena: { hp: 3, maxHp: 3, score: 0, wave: 0, over: false, spawnT: 0.4, kills: 0, heartT: 0, seed: s0, nextId: 0, seen: {} },
+      warns: [],
+    };
+    for (let k = 0; k < 4; k++) rnd(S);
+    S.rand = () => rnd(S);
+    return S;
+  }
+
+  // a free spot for something of radius r: clear of hedges, thorns and the room edge with room for the
+  // hero to walk all the way round it (as for dizzy dashers), off other grumps and announced spawns,
+  // and between minD and maxD from the hero
+  const loopRoom = (r) => r + 2 * C.PLAYER_R + C.DIZZY_ROOM;
+  function spotOk(S, x, y, r, minD, maxD) {
+    const d = Math.hypot(x - S.player.x, y - S.player.y);
+    if (d < minD || d > maxD || clearance(S, x, y) < loopRoom(r)) return false;
+    for (const e of S.enemies) if (e.alive && Math.hypot(e.x - x, e.y - y) < e.r + r + 40) return false;
+    for (const w of S.warns) if (Math.hypot(w.x - x, w.y - y) < radiusOf(w.kind) + r + 40) return false;
+    return true;
+  }
+  function pickSpot(S, r, minD, maxD, tries) {
+    const m = loopRoom(r);
+    for (let k = 0; k < tries; k++) {
+      const x = m + rnd(S) * (S.W - 2 * m), y = m + rnd(S) * (S.H - 2 * m);
+      if (spotOk(S, x, y, r, minD, maxD)) return { x, y };
+    }
+    return null;
+  }
+  // walker lanes and snipper rounds stay far enough from hedges and thorns for the hero to pass on both
+  // sides (the start of the path, where the grump appears, has full loop room)
+  function segClear(S, ax, ay, bx, by, r) {
+    const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / 12));
+    for (let i = 0; i <= n; i++) if (clearance(S, ax + ((bx - ax) * i) / n, ay + ((by - ay) * i) / n) < r + 2 * C.PLAYER_R + 8) return false;
+    return true;
+  }
+  // walkers of one group march in step along parallel lanes (they stay a tight, loopable bunch)
+  function wanderPaths(S, pts, r) {
+    for (let k = 0; k < 8; k++) {
+      const a = rnd(S) * Math.PI * 2, L = 200 + rnd(S) * 140, dx = Math.cos(a) * L, dy = Math.sin(a) * L;
+      if (pts.every((q) => segClear(S, q.x, q.y, q.x + dx, q.y + dy, r))) return pts.map((q) => [{ x: q.x, y: q.y }, { x: q.x + dx, y: q.y + dy }]);
+    }
+    return null;
+  }
+  function cutterPath(S, s, r) {
+    const side = 160, k0 = Math.floor(rnd(S) * 4), signs = [[1, 1], [1, -1], [-1, -1], [-1, 1]];
+    for (let i = 0; i < 4; i++) {
+      const [sx, sy] = signs[(k0 + i) % 4];
+      const c = [{ x: s.x, y: s.y }, { x: s.x + sx * side, y: s.y }, { x: s.x + sx * side, y: s.y + sy * side }, { x: s.x, y: s.y + sy * side }];
+      if (c.every((a, j) => { const b = c[(j + 1) % 4]; return segClear(S, a.x, a.y, b.x, b.y, r); })) return c;
+    }
+    return null;
+  }
+  function specFor(kind, w) {
+    switch (kind) {
+      case 'chaser': return { kind, range: 1e9, leash: 1e9, speed: 58 + Math.min(26, w) };
+      case 'big': return { kind, r: 36, range: 1e9, leash: 1e9, speed: 46 + Math.min(12, w / 2) };
+      case 'dasher': return { kind, range: 290, stalk: 42 };
+      case 'cutter': return { kind, loop: true, speed: 68 + Math.min(20, w) };
+      case 'wander': return { kind, speed: 52 + Math.min(24, w) };
+      default: return { kind: 'sleepy' };
+    }
+  }
+  // far spots first (>= 380 px), then anything fair (>= ARENA_SAFE)
+  function placeOne(S, kind, w) {
+    const r = radiusOf(kind);
+    for (const minD of [380, C.ARENA_SAFE]) for (let k = 0; k < 30; k++) {
+      const s = pickSpot(S, r, minD, 1e9, 1);
+      if (!s) continue;
+      const spec = specFor(kind, w);
+      if (kind === 'wander') { const ps = wanderPaths(S, [s], r); if (!ps) continue; spec.path = ps[0]; }
+      if (kind === 'cutter') { const c = cutterPath(S, s, r); if (!c) continue; spec.path = c; }
+      return [{ x: s.x, y: s.y, spec }];
+    }
+    return null;
+  }
+  // a tight bunch (58 px apart: too close to slip between) that one loop can catch together
+  function placeCluster(S, kind, n, w) {
+    const r = radiusOf(kind), off = n === 2 ? 29 : 33.5;
+    for (const minD of [400, C.ARENA_SAFE + off]) for (let k = 0; k < 30; k++) {
+      const c = pickSpot(S, r + off, minD, 1e9, 1);
+      if (!c) continue;
+      const a0 = rnd(S) * Math.PI * 2, pts = [];
+      for (let i = 0; i < n; i++) { const a = a0 + (i * 2 * Math.PI) / n; pts.push({ x: c.x + off * Math.cos(a), y: c.y + off * Math.sin(a) }); }
+      if (pts.some((q) => Math.hypot(q.x - S.player.x, q.y - S.player.y) < C.ARENA_SAFE || clearance(S, q.x, q.y) < loopRoom(r))) continue;
+      const ps = kind === 'wander' ? wanderPaths(S, pts, r) : null;
+      if (kind === 'wander' && !ps) continue;
+      return pts.map((q, i) => ({ x: q.x, y: q.y, spec: Object.assign(specFor(kind, w), ps ? { path: ps[i] } : {}) }));
+    }
+    return null;
+  }
+  function chooseKind(S, w) {
+    // a kind whose wave has come is introduced on its own first (in unlock order, even if a full field
+    // delayed it)
+    for (const k in UNLOCK) if (UNLOCK[k] <= w && !S.arena.seen[k]) return k;
+    const count = (k) => S.enemies.filter((e) => e.alive && e.kind === k).length + S.warns.filter((q) => q.kind === k).length;
+    const opts = [];
+    const add = (k, wt) => { if (w >= UNLOCK[k] && wt > 0) opts.push([k, wt]); };
+    add('sleepy', Math.max(0.8, 3 - 0.12 * w));
+    add('wander', 2.4);
+    add('chaser', 2.6);
+    add('cutter', count('cutter') < 2 ? 1.2 : 0);
+    add('dasher', count('dasher') < 2 ? 1.3 : 0);
+    add('big', count('big') < 1 + Math.floor(w / 16) ? 0.9 : 0);
+    let tot = 0;
+    for (const o of opts) tot += o[1];
+    let x = rnd(S) * tot;
+    for (const [k, wt] of opts) if ((x -= wt) < 0) return k;
+    return opts[opts.length - 1][0];
+  }
+  function groupSize(S, kind, w) {
+    if (kind === 'sleepy') return w === 1 || (w >= 4 && rnd(S) < 0.5) ? 3 : 2;
+    if (kind === 'wander') return 2;
+    if (kind === 'chaser') return w >= 10 && rnd(S) < 0.4 ? 2 : 1;
+    return 1;
+  }
+  function announce(S, ev, kind, s) {
+    S.arena.seen[kind] = true;
+    S.warns.push({ x: s.x, y: s.y, kind, t: C.ARENA_WARN, spec: s.spec });
+    ev.push({ t: 'warn', x: s.x, y: s.y, kind });
+  }
+  function spawnWave(S, ev) {
+    const A = S.arena, w = A.wave;
+    const room = waveCap(w) - S.enemies.filter((e) => e.alive).length - S.warns.length;
+    if (room <= 0) return;
+    const kind = chooseKind(S, w);
+    const n = Math.min(room, groupSize(S, kind, w));
+    let spots = n >= 2 && (kind === 'sleepy' || kind === 'wander') ? placeCluster(S, kind, n, w) : null;
+    if (spots) { for (const s of spots) announce(S, ev, kind, s); return; }
+    for (let i = 0; i < n; i++) { spots = placeOne(S, kind, w); if (spots) announce(S, ev, kind, spots[0]); }
+  }
+
+  function arenaHit(S, ev, why, sx, sy) {
+    const p = S.player, A = S.arena;
+    if (p.inv > 0 || A.over) return;
+    A.hp -= 1; S.hurts++;
+    let dx = p.x - sx, dy = p.y - sy, L = Math.hypot(dx, dy);
+    if (L < 1e-6) { dx = 0; dy = 1; L = 1; }
+    p.kb = C.ARENA_KNOCK_T; p.kbx = dx / L; p.kby = dy / L; p.inv = C.ARENA_INV;
+    clearTrail(S);
+    ev.push({ t: 'hp', hp: A.hp, x: p.x, y: p.y, why });
+    if (A.hp <= 0) {
+      A.hp = 0; A.over = true; p.kb = 0; p.vx = p.vy = 0; p.moving = 0;
+      ev.push({ t: 'over', score: A.score });
+    }
+  }
+  // knock-back: ARENA_KNOCK px along (kbx, kby), easing out over ARENA_KNOCK_T; input is ignored meanwhile
+  function knock(S, dt) {
+    const p = S.player, T = C.ARENA_KNOCK_T, v0 = (2 * C.ARENA_KNOCK) / T;
+    const h = Math.min(dt, p.kb), v = (v0 * (p.kb - h / 2)) / T;
+    p.vx = p.kbx * v; p.vy = p.kby * v;
+    p.x += p.vx * h; p.y += p.vy * h;
+    collide(S, p, C.PLAYER_R, false);
+    p.kb -= h;
+    if (p.kb <= 1e-9) { p.kb = 0; p.vx = p.vy = 0; }
+    p.moving = Math.hypot(p.vx, p.vy);
+  }
+
+  function arenaStep(S, input, dt, ev) {
+    S.t += dt;
+    const A = S.arena, p = S.player;
+    for (const e of S.enemies) if (!e.alive && e.pop > 0) e.pop = Math.max(0, e.pop - dt * 1.6);
+    if (A.over) return;
+    if (p.inv > 0) p.inv = Math.max(0, p.inv - dt);
+    if (p.kb > 0) knock(S, dt); else movePlayer(S, input, dt, ev);
+
+    for (const e of S.enemies) {
+      if (!e.alive) continue;
+      moveEnemy(S, e, dt, ev);
+      if (Math.hypot(p.x - e.x, p.y - e.y) < C.PLAYER_R + e.r - 5) arenaHit(S, ev, 'enemy', e.x, e.y);
+      snip(S, e, ev);
+    }
+    for (const R of S.thorns) if (!A.over && circRect(p.x, p.y, C.PLAYER_R - 4, R)) {
+      let sx = Math.max(R.x, Math.min(p.x, R.x + R.w)), sy = Math.max(R.y, Math.min(p.y, R.y + R.h));
+      if (sx === p.x && sy === p.y) { sx = R.x + R.w / 2; sy = R.y + R.h / 2; }
+      arenaHit(S, ev, 'thorn', sx, sy);
+      break;
+    }
+    if (A.over) return;
+
+    // hearts: one appears HEART_EVERY s after the hero is hurt; walking over it heals (nothing is carried)
+    const heart = S.items.find((it) => it.kind === 'heart');
+    if (heart) {
+      if (A.hp < A.maxHp && Math.hypot(p.x - heart.x, p.y - heart.y) < C.PICK_R + 4) {
+        A.hp++; S.items.splice(S.items.indexOf(heart), 1); S.lastProgress = S.t;
+        ev.push({ t: 'heal', x: heart.x, y: heart.y, hp: A.hp });
+      }
+    } else if (A.hp < A.maxHp) {
+      A.heartT += dt;
+      if (A.heartT >= C.HEART_EVERY) {
+        const s = pickSpot(S, 14, 160, 560, 40);
+        if (s) { S.items.push({ kind: 'heart', x: s.x, y: s.y, hx: s.x, hy: s.y, taken: false, used: false }); A.heartT = 0; }
+      }
+    } else A.heartT = 0;
+
+    // golden spool: walking over it doubles the ribbon for a while, so giant combo loops fit
+    if (A.boost > 0) { A.boost -= dt; if (A.boost <= 0) { A.boost = 0; S.trailMax = 0; ev.push({ t: 'boostEnd' }); } }
+    const spool = S.items.find((it) => it.kind === 'spool');
+    if (spool) {
+      if (Math.hypot(p.x - spool.x, p.y - spool.y) < C.PICK_R + 6) {
+        S.items.splice(S.items.indexOf(spool), 1); A.boost = 8; S.trailMax = C.TRAIL_MAX * 2; S.lastProgress = S.t;
+        ev.push({ t: 'boost', x: spool.x, y: spool.y });
+      }
+    } else if (!(A.boost > 0)) {
+      A.spoolT = (A.spoolT || 0) + dt;
+      if (A.spoolT >= 16) {
+        const sp2 = pickSpot(S, 14, 180, 520, 40);
+        if (sp2) { S.items.push({ kind: 'spool', x: sp2.x, y: sp2.y, hx: sp2.x, hy: sp2.y, taken: false, used: false }); A.spoolT = 0; }
+      }
+    }
+
+    // announced grumps appear after ARENA_WARN s; a ring the hero ran up to hops somewhere fair instead
+    if (S.warns.length) {
+      const keep = [];
+      for (const w of S.warns) {
+        w.t -= dt;
+        if (w.t > 0) { keep.push(w); continue; }
+        if (Math.hypot(w.x - p.x, w.y - p.y) < C.ARENA_SAFE) {
+          const s = placeOne(S, w.kind, A.wave);
+          if (s) { w.x = s[0].x; w.y = s[0].y; w.spec = s[0].spec; w.t = C.ARENA_WARN; ev.push({ t: 'warn', x: w.x, y: w.y, kind: w.kind }); }
+          else w.t = 0;
+          keep.push(w);
+          continue;
+        }
+        S.enemies.push(mkEnemy(Object.assign({ x: w.x, y: w.y }, w.spec), A.nextId++));
+        ev.push({ t: 'spawned', x: w.x, y: w.y, kind: w.kind });
+      }
+      S.warns = keep;
+    }
+
+    // waves: on a timer, sooner when the field is empty
+    A.spawnT -= dt;
+    if (A.wave > 0 && A.spawnT > 0.8 && !S.warns.length && !S.enemies.some((e) => e.alive)) A.spawnT = 0.8;
+    if (A.spawnT <= 0) { A.wave++; spawnWave(S, ev); A.spawnT = waveGap(A.wave); }
+
+    if (S.enemies.some((e) => !e.alive && e.pop <= 0)) S.enemies = S.enemies.filter((e) => e.alive || e.pop > 0);
+  }
+  LG.makeArena = makeArena;
+
+  LG.step = step;
+  LG.blockers = blockers;
+  LG.stars = (S) => S.sparkles.filter((s) => s.got).length;
+  // finished the room within its par time (best-time seal)
+  LG.parMet = (S) => {
+    const L = S.li >= 0 ? LG.LEVELS[S.li] : null;
+    return !!(L && S.won && S.winAt - (S.clock0 || 0) <= L.par);
+  };
+  // seconds on the sun clock: from the first step to now (or to the win)
+  LG.clock = (S) => (S.clock0 == null ? 0 : (S.won ? S.winAt : S.t) - S.clock0);
+})(typeof window !== 'undefined' ? window : globalThis);
+
+;
+// Loop Garden — hand-authored rooms. Each room adds one new idea on top of what came before.
+// theme: 0 meadow, 1 orchard, 2 pond, 3 autumn, 4 snow, 5 sunset (worlds change every two rooms)
+// par: best-time seal in seconds (≈ 1.3 × the scripted solution + 1 s after review v0.5 found 1.8× too lenient; was 1.35 × in tests/solutions.routes.mjs)
+// icon: level-map tile picture for the room's new idea
+(function (G) {
+  'use strict';
+  const LG = G.LG || (G.LG = {});
+  const P = (x, y) => ({ x, y });
+
+  // top hedge row with the task gate in its gap, exit portal behind it
+  function top(W, gx1, gx2, y = 170) {
+    return {
+      walls: [{ x: 0, y, w: gx1, h: 36 }, { x: gx2, y, w: W - gx2, h: 36 }],
+      gate: { x: gx1, y, w: gx2 - gx1, h: 36 },
+      exit: P((gx1 + gx2) / 2, y - 80),
+    };
+  }
+  function room(o) {
+    const t = top(o.w, o.gate[0], o.gate[1]);
+    return Object.assign({}, o, { walls: t.walls.concat(o.walls || []), gate: t.gate, exit: t.exit });
+  }
+
+  LG.LEVELS = [
+    // 1 — move, circle the sleepy grump; sparkles sketch the circle. The grump sits beside (not on)
+    // the straight start→gate walk so a first push of the stick never bumps into it.
+    room({
+      w: 760, h: 1000, start: P(380, 900), gate: [320, 440], theme: 0, icon: 'sleepy', par: 9,
+      enemies: [{ kind: 'sleepy', x: 240, y: 580 }],
+      sparkles: [P(130, 580), P(350, 580), P(240, 470)],
+      decor: 11,
+    }),
+    // 2 — two sleepers and a slow walker
+    room({
+      w: 900, h: 1100, start: P(450, 1000), gate: [390, 510], theme: 0, icon: 'wander', par: 29,
+      walls: [{ x: 420, y: 600, w: 60, h: 120 }],
+      enemies: [
+        { kind: 'sleepy', x: 220, y: 760 },
+        { kind: 'sleepy', x: 680, y: 760 },
+        { kind: 'wander', x: 200, y: 420, path: [P(200, 420), P(700, 420)], speed: 60 },
+      ],
+      sparkles: [P(450, 860), P(110, 420), P(790, 420)],
+      decor: 12,
+    }),
+    // 3 — combo: grumps huddled too tight to slip between (58–60 px apart) can only be caught together.
+    // A sleepy trio, then a pair that marches in step; one loop each.
+    room({
+      w: 900, h: 1100, start: P(450, 1000), gate: [390, 510], theme: 1, icon: 'combo', par: 21,
+      enemies: [
+        { kind: 'sleepy', x: 240, y: 700 },
+        { kind: 'sleepy', x: 300, y: 700 },
+        { kind: 'sleepy', x: 270, y: 752 },
+        { kind: 'wander', x: 520, y: 430, path: [P(330, 430), P(720, 430)], pi: 0, speed: 50 },
+        { kind: 'wander', x: 520, y: 488, path: [P(330, 488), P(720, 488)], pi: 0, speed: 50 },
+      ],
+      sparkles: [P(270, 560), P(110, 720), P(845, 459)],
+      decor: 12,
+    }),
+    // 4 — a friend wants an apple
+    room({
+      w: 900, h: 1100, start: P(450, 1000), gate: [390, 510], theme: 1, icon: 'bunny', par: 36,
+      walls: [{ x: 280, y: 560, w: 30, h: 230 }, { x: 0, y: 540, w: 140, h: 30 }],
+      items: [{ kind: 'apple', x: 140, y: 680 }],
+      npcs: [{ who: 'bunny', want: 'apple', x: 700, y: 330 }],
+      enemies: [
+        { kind: 'sleepy', x: 620, y: 760 },
+        { kind: 'wander', x: 300, y: 420, path: [P(300, 420), P(620, 420)], speed: 55 },
+      ],
+      sparkles: [P(80, 960), P(820, 620), P(450, 290)],
+      decor: 12,
+    }),
+    // 5 — circle a bud to grow a bridge; carry a fish to the frog
+    room({
+      w: 900, h: 1200, start: P(450, 1100), gate: [390, 510], theme: 2, icon: 'frog', par: 34,
+      water: [{ id: 'r', x: 0, y: 560, w: 900, h: 110, bridge: { x1: 385, x2: 515 } }],
+      buds: [{ x: 450, y: 800, water: 'r' }],
+      items: [{ kind: 'fish', x: 790, y: 920 }],
+      npcs: [{ who: 'frog', want: 'fish', x: 200, y: 360 }],
+      enemies: [
+        { kind: 'sleepy', x: 190, y: 930 },
+        { kind: 'wander', x: 520, y: 330, path: [P(520, 330), P(800, 330)], speed: 60 },
+      ],
+      sparkles: [P(820, 1120), P(80, 760), P(660, 330)],
+      decor: 14,
+    }),
+    // 6 — thorns hurt, lanterns remember: two thorn hedges with offset gaps split the room into three
+    // fields; a lantern stands in each gap, so a poke only sends you back to the last one you passed
+    room({
+      w: 1000, h: 1300, start: P(500, 1200), gate: [440, 560], theme: 2, icon: 'thorns', par: 43,
+      thorns: [
+        { x: 0, y: 920, w: 300, h: 40 }, { x: 520, y: 920, w: 480, h: 40 },
+        { x: 0, y: 590, w: 480, h: 40 }, { x: 700, y: 590, w: 300, h: 40 },
+        { x: 290, y: 1060, w: 90, h: 40 },
+        { x: 790, y: 260, w: 40, h: 100 }, { x: 920, y: 260, w: 40, h: 100 },
+      ],
+      enemies: [
+        { kind: 'sleepy', x: 760, y: 1110 },
+        { kind: 'sleepy', x: 200, y: 770 },
+        { kind: 'sleepy', x: 830, y: 770 },
+        { kind: 'wander', x: 260, y: 410, path: [P(260, 410), P(700, 410)], speed: 60 },
+      ],
+      lanterns: [P(410, 870), P(590, 550)],
+      sparkles: [P(875, 300), P(480, 410), P(940, 1240)],
+      decor: 14,
+    }),
+    // 7 — chasers wake when you come near; free the bird from its cage
+    room({
+      w: 1000, h: 1300, start: P(500, 1200), gate: [440, 560], theme: 3, icon: 'chaser', par: 27,
+      thorns: [{ x: 0, y: 860, w: 360, h: 40 }, { x: 640, y: 860, w: 360, h: 40 }],
+      cages: [{ x: 820, y: 560, who: 'bird', task: true }],
+      enemies: [
+        { kind: 'chaser', x: 500, y: 660, range: 210, speed: 72 },
+        { kind: 'chaser', x: 230, y: 330, range: 200, speed: 72 },
+      ],
+      lanterns: [P(160, 770)],
+      sparkles: [P(640, 560), P(70, 560), P(500, 330)],
+      decor: 14,
+    }),
+    // 8 — snippers cut your ribbon
+    room({
+      w: 1000, h: 1200, start: P(500, 1100), gate: [440, 560], theme: 3, icon: 'cutter', par: 43,
+      enemies: [
+        { kind: 'sleepy', x: 300, y: 800 },
+        { kind: 'cutter', x: 180, y: 690, path: [P(180, 690), P(420, 690), P(420, 910), P(180, 910)], loop: true, speed: 60, required: false },
+        { kind: 'sleepy', x: 700, y: 430 },
+        { kind: 'cutter', x: 560, y: 300, path: [P(560, 300), P(560, 560), P(840, 560), P(840, 300)], loop: true, speed: 75, required: false },
+        { kind: 'wander', x: 120, y: 450, path: [P(120, 450), P(440, 450)], speed: 70 },
+      ],
+      walls: [{ x: 600, y: 760, w: 40, h: 160 }],
+      lanterns: [P(860, 760)],
+      sparkles: [P(300, 800 - 150), P(380, 870), P(700, 270)],
+      decor: 14,
+    }),
+    // 9 — dashers charge; let them bonk, then circle. A key opens the door.
+    room({
+      w: 1000, h: 1300, start: P(150, 1200), gate: [440, 560], theme: 4, icon: 'dasher', par: 38,
+      walls: [{ x: 0, y: 600, w: 450, h: 36 }, { x: 550, y: 600, w: 450, h: 36 }],
+      doors: [{ id: 'd1', x: 450, y: 600, w: 100, h: 36, lock: 'key' }],
+      items: [{ kind: 'key', x: 860, y: 1060 }],
+      thorns: [{ x: 150, y: 880, w: 140, h: 40 }, { x: 300, y: 330, w: 40, h: 130 }, { x: 660, y: 330, w: 40, h: 130 }],
+      enemies: [
+        { kind: 'dasher', x: 640, y: 930, range: 270 },
+        { kind: 'dasher', x: 500, y: 420, range: 280 },
+        { kind: 'sleepy', x: 820, y: 760 },
+      ],
+      lanterns: [P(260, 690)],
+      sparkles: [P(640, 1040), P(80, 300), P(920, 700)],
+      decor: 14,
+    }),
+    // 10 — big grumps take two loops: the first shrinks one into a quick, angry little grump (it stands
+    // dazed for a moment first). A dozing one to practise on, then one that lumbers after you.
+    room({
+      w: 1000, h: 1200, start: P(500, 1100), gate: [440, 560], theme: 4, icon: 'big', par: 36,
+      thorns: [{ x: 90, y: 430, w: 140, h: 40 }, { x: 770, y: 760, w: 140, h: 40 }],
+      enemies: [
+        { kind: 'big', x: 260, y: 820, range: 1 },
+        { kind: 'big', x: 640, y: 440, range: 240, leash: 300, speed: 50 },
+        { kind: 'wander', x: 560, y: 980, path: [P(560, 980), P(860, 980)], speed: 60 },
+      ],
+      lanterns: [P(820, 640)],
+      sparkles: [P(60, 1140), P(940, 980), P(640, 290)],
+      decor: 14,
+    }),
+    // 11 — free the chick and lead it home past the big grump
+    room({
+      w: 1100, h: 1400, start: P(200, 1300), gate: [490, 610], theme: 5, icon: 'hen', par: 67,
+      cages: [{ x: 880, y: 1160, who: 'chick', releases: 'c1' }],
+      followers: [{ id: 'c1', kind: 'chick', x: 880, y: 1160, free: false }],
+      npcs: [{ who: 'hen', want: 'chick', x: 200, y: 330 }],
+      thorns: [{ x: 380, y: 980, w: 40, h: 160 }, { x: 700, y: 470, w: 160, h: 40 }],
+      enemies: [
+        { kind: 'wander', x: 120, y: 830, path: [P(120, 830), P(980, 830)], speed: 80 },
+        { kind: 'wander', x: 980, y: 640, path: [P(980, 640), P(120, 640)], speed: 70 },
+        { kind: 'big', x: 560, y: 360, range: 240, leash: 260, speed: 55 },
+      ],
+      lanterns: [P(960, 740)],
+      sparkles: [P(550, 830), P(1040, 1340), P(1040, 300)],
+      decor: 16,
+    }),
+    // 12 — remix: everything you learned. Bait the dasher and catch it dizzy, lasso the bud together
+    // with the snipper that circles it, cross the bridge, then the sleepy pair and the caged bird
+    // inside the second snipper's round.
+    room({
+      w: 1100, h: 1400, start: P(550, 1300), gate: [490, 610], theme: 5, icon: 'bird', par: 36,
+      water: [{ id: 'r', x: 0, y: 640, w: 1100, h: 110, bridge: { x1: 485, x2: 615 } }],
+      walls: [{ x: 150, y: 1000, w: 40, h: 150 }],
+      buds: [{ x: 550, y: 940, water: 'r' }],
+      cages: [{ x: 880, y: 400, who: 'bird', task: true }],
+      thorns: [{ x: 900, y: 1150, w: 120, h: 40 }],
+      enemies: [
+        { kind: 'dasher', x: 300, y: 1080, range: 250 },
+        { kind: 'cutter', x: 490, y: 880, path: [P(490, 880), P(610, 880), P(610, 1000), P(490, 1000)], loop: true, speed: 55, required: false },
+        { kind: 'sleepy', x: 230, y: 420 },
+        { kind: 'sleepy', x: 288, y: 420 },
+        { kind: 'cutter', x: 740, y: 260, path: [P(740, 260), P(1020, 260), P(1020, 540), P(740, 540)], loop: true, speed: 65, required: false },
+      ],
+      lanterns: [P(550, 600)],
+      sparkles: [P(240, 990), P(1040, 860), P(800, 320)],
+      decor: 16,
+    }),
+    // ---- mastery remixes: longer rooms that combine learned ideas, each with its own twist ----
+    // 13 — two rivers: grow one bridge, fetch the key from the thorn nook, grow the second bridge while
+    // carrying it, clear the upper garden and unlock the door under the gate
+    room({
+      w: 1100, h: 1540, start: P(550, 1440), gate: [490, 610], theme: 0, icon: 'frog', par: 63,
+      water: [
+        { id: 'a', x: 0, y: 1060, w: 1100, h: 100, bridge: { x1: 700, x2: 820 } },
+        { id: 'b', x: 0, y: 620, w: 1100, h: 100, bridge: { x1: 160, x2: 280 } },
+      ],
+      walls: [{ x: 0, y: 330, w: 490, h: 36 }, { x: 610, y: 330, w: 490, h: 36 }],
+      doors: [{ id: 'd', x: 490, y: 330, w: 120, h: 36, lock: 'key' }],
+      buds: [{ x: 760, y: 1300, water: 'a' }, { x: 200, y: 890, water: 'b' }],
+      items: [{ kind: 'key', x: 1000, y: 790 }],
+      thorns: [{ x: 900, y: 860, w: 110, h: 30 }, { x: 900, y: 960, w: 110, h: 30 }],
+      enemies: [
+        { kind: 'sleepy', x: 250, y: 1300 },
+        { kind: 'sleepy', x: 308, y: 1300 },
+        { kind: 'wander', x: 380, y: 890, path: [P(380, 890), P(700, 890)], speed: 55 },
+        { kind: 'wander', x: 150, y: 490, path: [P(150, 490), P(560, 490)], speed: 65 },
+        { kind: 'sleepy', x: 820, y: 490 },
+        { kind: 'sleepy', x: 878, y: 490 },
+      ],
+      lanterns: [P(760, 1030), P(220, 590)],
+      sparkles: [P(965, 925), P(85, 490), P(1050, 420)],
+      decor: 16,
+    }),
+    // 14 — snipper garden: lasso a sleeper with the snipper that circles it, loop another inside a wide
+    // round, then free the chick and walk it home through the corridor between two rounds
+    room({
+      w: 1100, h: 1500, start: P(300, 1420), gate: [490, 610], theme: 1, icon: 'hen', par: 41,
+      cages: [{ x: 900, y: 1290, who: 'chick', releases: 'c1' }],
+      followers: [{ id: 'c1', kind: 'chick', x: 900, y: 1290, free: false }],
+      npcs: [{ who: 'hen', want: 'chick', x: 180, y: 300 }],
+      thorns: [{ x: 560, y: 990, w: 40, h: 150 }, { x: 900, y: 430, w: 160, h: 40 }],
+      enemies: [
+        { kind: 'wander', x: 760, y: 1250, path: [P(760, 1250), P(400, 1250)], speed: 50 },
+        { kind: 'sleepy', x: 300, y: 1010 },
+        { kind: 'cutter', x: 230, y: 940, path: [P(230, 940), P(370, 940), P(370, 1080), P(230, 1080)], loop: true, speed: 55, required: false },
+        { kind: 'sleepy', x: 760, y: 720 },
+        { kind: 'cutter', x: 640, y: 600, path: [P(640, 600), P(880, 600), P(880, 840), P(640, 840)], loop: true, speed: 65, required: false },
+        { kind: 'cutter', x: 260, y: 360, path: [P(260, 360), P(480, 360), P(480, 560), P(260, 560)], loop: true, speed: 60, required: false },
+      ],
+      lanterns: [P(1000, 980), P(560, 600)],
+      sparkles: [P(370, 460), P(690, 660), P(1050, 1100)],
+      decor: 16,
+    }),
+    // 15 — dasher gauntlet: stand on the sparkle so both twins charge at once from opposite sides; they
+    // stop dizzy side by side and one loop takes both. Then a dasher by a sleepy trio, and one at the
+    // top between two thorn posts.
+    room({
+      w: 1000, h: 1500, start: P(500, 1440), gate: [440, 560], theme: 2, icon: 'dasher', par: 36,
+      walls: [
+        { x: 0, y: 960, w: 420, h: 36 }, { x: 580, y: 960, w: 420, h: 36 },
+        { x: 0, y: 560, w: 780, h: 36 },
+      ],
+      thorns: [{ x: 300, y: 290, w: 40, h: 130 }, { x: 660, y: 290, w: 40, h: 130 }],
+      enemies: [
+        { kind: 'dasher', x: 130, y: 1150, range: 400, dizzy: 2.6 },
+        { kind: 'dasher', x: 870, y: 1150, range: 400, dizzy: 2.6 },
+        { kind: 'dasher', x: 250, y: 780, range: 230 },
+        { kind: 'sleepy', x: 780, y: 760 },
+        { kind: 'sleepy', x: 838, y: 760 },
+        { kind: 'sleepy', x: 809, y: 810 },
+        { kind: 'dasher', x: 500, y: 400, range: 240 },
+        { kind: 'sleepy', x: 850, y: 350 },
+        { kind: 'sleepy', x: 908, y: 350 },
+      ],
+      lanterns: [P(500, 900), P(890, 520)],
+      sparkles: [P(500, 1250), P(150, 880), P(500, 310)],
+      decor: 16,
+    }),
+    // 16 — big-grump siege: three thorn hedges, a lantern in each gap (a relay of checkpoints) and a big
+    // grump holding each field; every big takes two loops and turns quick and angry in between
+    room({
+      w: 1100, h: 1700, start: P(550, 1620), gate: [490, 610], theme: 3, icon: 'big', par: 62,
+      thorns: [
+        { x: 0, y: 1280, w: 380, h: 40 }, { x: 560, y: 1280, w: 540, h: 40 },
+        { x: 0, y: 880, w: 600, h: 40 }, { x: 780, y: 880, w: 320, h: 40 },
+        { x: 0, y: 500, w: 320, h: 40 }, { x: 500, y: 500, w: 600, h: 40 },
+      ],
+      enemies: [
+        { kind: 'big', x: 820, y: 1500, range: 1 },
+        { kind: 'sleepy', x: 250, y: 1460 },
+        { kind: 'big', x: 300, y: 1100, range: 230, leash: 280, speed: 50 },
+        { kind: 'sleepy', x: 850, y: 1100 },
+        { kind: 'sleepy', x: 908, y: 1100 },
+        { kind: 'big', x: 850, y: 680, range: 220, leash: 260, speed: 50 },
+        { kind: 'sleepy', x: 800, y: 330 },
+        { kind: 'sleepy', x: 858, y: 330 },
+        { kind: 'sleepy', x: 829, y: 380 },
+      ],
+      lanterns: [P(470, 1250), P(690, 850), P(410, 470)],
+      sparkles: [P(300, 960), P(1000, 760), P(1010, 280)],
+      decor: 18,
+    }),
+    // 17 — double delivery: the frog by the river builds the bridge for a fish; then the apple goes across
+    // to the bunny. A chaser guards each half of the garden.
+    room({
+      w: 1100, h: 1500, start: P(550, 1420), gate: [490, 610], theme: 4, icon: 'bunny', par: 41,
+      water: [{ id: 'r', x: 0, y: 660, w: 1100, h: 100, bridge: { x1: 490, x2: 610 } }],
+      thorns: [{ x: 300, y: 1180, w: 140, h: 40 }, { x: 660, y: 1180, w: 140, h: 40 }],
+      items: [{ kind: 'fish', x: 980, y: 1350 }, { kind: 'apple', x: 130, y: 1350 }],
+      npcs: [{ who: 'frog', want: 'fish', x: 150, y: 850, bridges: 'r' }, { who: 'bunny', want: 'apple', x: 920, y: 320 }],
+      enemies: [
+        { kind: 'chaser', x: 550, y: 1060, range: 220, speed: 72 },
+        { kind: 'chaser', x: 550, y: 420, range: 220, speed: 72 },
+        { kind: 'sleepy', x: 200, y: 430 },
+        { kind: 'sleepy', x: 258, y: 430 },
+      ],
+      lanterns: [P(550, 620)],
+      sparkles: [P(550, 900), P(1050, 1180), P(550, 290)],
+      decor: 16,
+    }),
+    // 18 — grand finale: a sleepy trio and a dasher, a thorn hedge, the bud lassoed with its snipper to
+    // bridge the river, a walker and the caged bird inside a wide snipper round, a second hedge, and a big
+    // grump (two loops) with a sleepy pair guarding the gate
+    room({
+      w: 1200, h: 1900, start: P(600, 1820), gate: [540, 660], theme: 5, icon: 'combo', par: 65,
+      water: [{ id: 'r', x: 0, y: 1060, w: 1200, h: 100, bridge: { x1: 540, x2: 660 } }],
+      thorns: [
+        { x: 0, y: 1500, w: 520, h: 40 }, { x: 700, y: 1500, w: 500, h: 40 },
+        { x: 0, y: 620, w: 760, h: 40 }, { x: 940, y: 620, w: 260, h: 40 },
+      ],
+      buds: [{ x: 600, y: 1330, water: 'r' }],
+      cages: [{ x: 300, y: 860, who: 'bird', task: true }],
+      enemies: [
+        { kind: 'sleepy', x: 300, y: 1660 },
+        { kind: 'sleepy', x: 358, y: 1660 },
+        { kind: 'sleepy', x: 329, y: 1710 },
+        { kind: 'dasher', x: 900, y: 1630, range: 250 },
+        { kind: 'cutter', x: 540, y: 1270, path: [P(540, 1270), P(660, 1270), P(660, 1390), P(540, 1390)], loop: true, speed: 55, required: false },
+        { kind: 'wander', x: 830, y: 820, path: [P(640, 820), P(1000, 820)], pi: 0, speed: 50 },
+        { kind: 'cutter', x: 160, y: 720, path: [P(160, 720), P(440, 720), P(440, 1000), P(160, 1000)], loop: true, speed: 65, required: false },
+        { kind: 'big', x: 600, y: 400, range: 220, leash: 260, speed: 50 },
+        { kind: 'sleepy', x: 1000, y: 330 },
+        { kind: 'sleepy', x: 1058, y: 330 },
+      ],
+      lanterns: [P(610, 1470), P(600, 1030), P(850, 590)],
+      sparkles: [P(570, 1300), P(230, 790), P(600, 315)],
+      decor: 20,
+    }),
+  ];
+})(typeof window !== 'undefined' ? window : globalThis);
+
+;
+// Loop Garden — portal adapter. The build sets window.LG_TARGET ('standalone' | 'gd' | 'cg') and,
+// for GameDistribution, window.LG_GD_ID. Ads only run at natural breaks and always settle
+// (shown / no fill / error / timeout) so the game can never get stuck behind one.
+(function (G) {
+  'use strict';
+  const LG = G.LG || (G.LG = {});
+  const target = G.LG_TARGET || 'standalone';
+  const AD_GAP = 180; // seconds between breaks
+  const AD_TIMEOUT = 12000;
+  let lastAd = 0, pending = null, prerollDone = false, playing = false;
+  let onPause = () => {}, onResume = () => {}, onMute = () => {}, onRemote = () => {};
+  let cg = null; // CrazyGames SDK once initialised
+  let pg = null; // Playgama Bridge once initialised
+  const pgSend = (m) => { try { const r = pg && pg.platform.sendMessage(m); if (r && r.catch) r.catch(() => {}); } catch (e) { /* telemetry only */ } };
+
+  function settle(outcome) {
+    const p = pending; pending = null;
+    if (!p) return;
+    clearTimeout(p.timer);
+    onResume();
+    p.resolve(outcome);
+  }
+  function loadScript(src, id) {
+    return new Promise((resolve) => {
+      const s = document.createElement('script');
+      s.src = src; s.async = true; s.id = id;
+      s.onload = () => resolve(true); s.onerror = () => resolve(false);
+      document.head.appendChild(s);
+    });
+  }
+
+  const P = {
+    target,
+    // main.js wires these to its own pause/mute so an ad freezes play and sound
+    bind(pause, resume, mute, remote) { onPause = pause; onResume = resume; if (mute) onMute = mute; if (remote) onRemote = remote; },
+    // portal cloud save (CrazyGames Data module); local storage stays the primary copy
+    saveData(key, value) {
+      try { cg && cg.data && cg.data.setItem(key, value); } catch (e) { /* local copy remains */ }
+      try { const r = pg && pg.storage.set([key], [value]); if (r && r.catch) r.catch(() => {}); } catch (e) { /* local copy remains */ }
+    },
+    get adActive() { return !!pending; },
+    // the portal is told when real play starts and stops (CrazyGames uses this for ad timing)
+    gameplayStart() { if (playing) return; playing = true; try { cg && cg.game.gameplayStart(); } catch (e) { /* telemetry only */ } pgSend('gameplay_started'); },
+    gameplayStop() { if (!playing) return; playing = false; try { cg && cg.game.gameplayStop(); } catch (e) { /* telemetry only */ } pgSend('gameplay_stopped'); },
+    loadingDone() { try { cg && cg.game.loadingStop(); } catch (e) { /* telemetry only */ } pgSend('game_ready'); },
+    // ask for an ad break; resolves when play may continue
+    showAd(kind) {
+      if (pending) return Promise.resolve('busy');
+      const now = performance.now() / 1000;
+      if (target === 'gd') {
+        if (!G.gdsdk || typeof G.gdsdk.showAd !== 'function') return Promise.resolve('unsupported');
+        if (kind === 'preroll') { if (prerollDone) return Promise.resolve('done'); prerollDone = true; }
+        else if (now - lastAd < AD_GAP) return Promise.resolve('skipped');
+        lastAd = now;
+        return new Promise((resolve) => {
+          pending = { resolve, timer: setTimeout(() => settle('timeout'), AD_TIMEOUT), opened: false };
+          try { G.gdsdk.showAd(); } catch (e) { settle('error'); }
+        });
+      }
+      if (target === 'cg') {
+        // CrazyGames shows its own pre-roll; the game only asks for midgame breaks
+        // Basic Launch forbids ads; midgame breaks are enabled only by a build flag after Full Launch
+        if (!G.LG_CG_ADS || !cg || kind === 'preroll' || now - lastAd < AD_GAP) return Promise.resolve('skipped');
+        lastAd = now;
+        return new Promise((resolve) => {
+          pending = { resolve, timer: setTimeout(() => settle('timeout'), AD_TIMEOUT), opened: false };
+          try {
+            cg.ad.requestAd('midgame', {
+              adStarted: () => { if (pending) { pending.opened = true; onPause(); } },
+              adFinished: () => settle('shown'),
+              adError: () => settle('unfilled'),
+            });
+          } catch (e) { settle('error'); }
+        });
+      }
+      if (target === 'pg') {
+        // Playgama's own config also enforces delays; ads only between rooms
+        const ad = pg && pg.advertisement;
+        if (!ad || kind === 'preroll' || ad.isInterstitialSupported === false || now - lastAd < AD_GAP) return Promise.resolve('skipped');
+        lastAd = now;
+        return new Promise((resolve) => {
+          pending = { resolve, timer: setTimeout(() => settle('timeout'), AD_TIMEOUT), opened: false };
+          try { ad.showInterstitial('level_end'); } catch (e) { settle('error'); }
+        });
+      }
+      return Promise.resolve('unsupported');
+    },
+  };
+
+  if (target === 'gd') {
+    G.GD_OPTIONS = {
+      gameId: G.LG_GD_ID || '',
+      // autoplay is off: the first ad is requested from a real player gesture
+      advertisementSettings: { autoplay: false },
+      onEvent(ev) {
+        const n = ev && ev.name;
+        if (n === 'SDK_GAME_PAUSE') { if (pending) { pending.opened = true; onPause(); } }
+        else if (n === 'SDK_GAME_START') settle(pending && pending.opened ? 'shown' : 'unfilled');
+        else if (n === 'SDK_ERROR') settle('error');
+      },
+    };
+    loadScript('https://html5.api.gamedistribution.com/main.min.js', 'gamedistribution-jssdk');
+  }
+  if (target === 'cg') {
+    loadScript('https://sdk.crazygames.com/crazygames-sdk-v3.js', 'crazygames-sdk-v3').then(async (ok) => {
+      const sdk = ok && G.CrazyGames && G.CrazyGames.SDK;
+      if (!sdk) return;
+      try { await sdk.init(); } catch (e) { return; }
+      cg = sdk;
+      // bring in progress saved on another device/session
+      try { const k = G.LG_SAVE_KEY, v = k && cg.data && cg.data.getItem(k); if (v) onRemote(v); } catch (e) { /* optional */ }
+      try { cg.game.loadingStart(); } catch (e) { /* telemetry only */ }
+      // honour the portal's mute setting
+      try {
+        if (cg.game.settings && cg.game.settings.muteAudio) onMute(true);
+        cg.game.addSettingsChangeListener && cg.game.addSettingsChangeListener((s) => onMute(!!(s && s.muteAudio)));
+      } catch (e) { /* settings are optional */ }
+      // the game is fully drawn by now
+      P.loadingDone();
+      if (playing) { playing = false; P.gameplayStart(); }
+    });
+  }
+  if (target === 'pg') {
+    loadScript('https://bridge.playgama.com/v2/stable/playgama-bridge.js', 'playgama-bridge').then(async (ok) => {
+      const b = ok && G.bridge;
+      if (!b) return;
+      try { await b.initialize({ configFilePath: './playgama-bridge-config.json' }); } catch (e) { return; }
+      pg = b;
+      const EV = b.EVENT_NAME || {};
+      try {
+        b.advertisement.on(EV.INTERSTITIAL_STATE_CHANGED, (state) => {
+          const st = String(state).toLowerCase();
+          if (st === 'loading' || st === 'opened') { if (pending && !pending.opened) { pending.opened = true; onPause(); } }
+          else if (st === 'closed' || st === 'completed') settle('shown');
+          else if (st === 'failed' || st === 'error') settle('unfilled');
+        });
+      } catch (e) { /* ads optional */ }
+      try { if (b.platform.isAudioEnabled === false) onMute(true); b.platform.on && b.platform.on(EV.AUDIO_STATE_CHANGED, (on) => onMute(!on)); } catch (e) { /* optional */ }
+      try { b.platform.on && b.platform.on(EV.PAUSE_STATE_CHANGED, (paused) => onMute(!!paused)); } catch (e) { /* optional */ }
+      // bring in progress saved in the Playgama cloud
+      try { const k = G.LG_SAVE_KEY; const v = k && await b.storage.get([k]); const val = Array.isArray(v) ? v[0] : v; if (val) onRemote(typeof val === 'string' ? val : JSON.stringify(val)); } catch (e) { /* optional */ }
+      P.loadingDone();
+      if (playing) { playing = false; P.gameplayStart(); }
+    });
+  }
+  LG.platform = P;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+;
+// Loop Garden — code-drawn "Paper Meadow" art kit (no raster assets).
+(function (G) {
+  'use strict';
+  const LG = G.LG || (G.LG = {});
+  const TAU = Math.PI * 2;
+  const C = LG.COL = {
+    ink: '#2A2340', cream: '#FFF4DC', paperShadow: 'rgba(42,35,64,0.18)',
+    hero: '#F4582E', heroShade: '#C9401C', cheek: '#FF9CA0',
+    sprout: '#4FB83E', sproutShade: '#348A2B',
+    gold: '#FFC83D', goldShade: '#E09A12',
+    teal: '#14A3AE', tealShade: '#0E7A84',
+    npc: '#A27BEA', npcSad: '#9A86C4', npcShade: '#7E57C9', npcInner: '#FFB8D0', tear: '#CFF3FF',
+    danger: '#3A2346', dangerFacet: '#5E4170', dangerEye: '#FF4D5E',
+    bud: '#9DB59B', budShade: '#7E977C', bloom: '#FF8FC0', bloomShade: '#E0609A', stem: '#5DAE48',
+    doorWood: '#B5703C', doorFrame: '#8A4F26', doorLight: '#FFF6C9', rays: '#FFE27A',
+    heart: '#FF5C8A',
+    grass: '#A8DC78', grassDeep: '#93CF64', grassLight: '#BDE68F',
+    hedge: '#6FB548', hedgeTop: '#8ACB5E', hedgeShade: '#4E9435',
+    water: '#6CC7EA', waterDeep: '#4AA8D4', waterLight: '#BDEBFA',
+    plank: '#C98A4E', plankShade: '#9C6236',
+  };
+  // six worlds; semantic colours never change, only scenery does
+  const THEMES = [
+    { name: 'meadow', wall: 'hedge', grass: '#A8DC78', deep: '#97D068', light: '#C2E994', hedge: '#6FB548', hedgeTop: '#8ACB5E', hedgeShade: '#4E9435', outside: '#5E9E42', decor: ['tuft', 'tuft', 'flower', 'pebble', 'clover'], amb: 'petal', music: 0 },
+    { name: 'orchard', wall: 'hedge', grass: '#B9DF80', deep: '#A6D16E', light: '#D4EDA2', hedge: '#79B04A', hedgeTop: '#96C866', hedgeShade: '#557F30', outside: '#6A9A3E', decor: ['tuft', 'petals', 'fruit', 'flower', 'clover'], amb: 'petal', music: 1 },
+    { name: 'pond', wall: 'rock', grass: '#9ED8A0', deep: '#88C98C', light: '#BFE8C0', hedge: '#9AA4A8', hedgeTop: '#C9D0D3', hedgeShade: '#6E777C', outside: '#4F8F6A', decor: ['tuft', 'puddle', 'lily', 'reed', 'pebble'], amb: 'mote', music: 2 },
+    { name: 'autumn', wall: 'log', grass: '#E3CF7E', deep: '#D6BC64', light: '#F0E1A6', hedge: '#B9773F', hedgeTop: '#E2B27A', hedgeShade: '#7E4A22', outside: '#B9743A', decor: ['leaf', 'leaf', 'mushroom', 'tuft', 'pebble'], amb: 'leaf', music: 3 },
+    { name: 'snow', wall: 'snow', grass: '#EEF4F8', deep: '#D5E3EE', light: '#FFFFFF', hedge: '#A9C7DA', hedgeTop: '#FFFFFF', hedgeShade: '#7FA3BB', outside: '#A9C3D3', decor: ['drift', 'drift', 'twig', 'pebble', 'snowtuft'], amb: 'snow', music: 4 },
+    { name: 'sunset', wall: 'brick', grass: '#EDCB9E', deep: '#E0B987', light: '#F7E2C4', hedge: '#C9805F', hedgeTop: '#E3A27E', hedgeShade: '#9A5A40', outside: '#7C8A4C', decor: ['tuft', 'flower', 'glow', 'pebble', 'clover'], amb: 'mote', music: 5 },
+  ];
+  LG.THEMES = THEMES;
+
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const easeOutBack = (x, s = 1.70158) => 1 + (s + 1) * (x - 1) ** 3 + s * (x - 1) ** 2;
+  LG.ease = { clamp, easeOutBack };
+
+  function rr(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+  function rrPath(x, y, w, h, r) {
+    const p = new Path2D();
+    p.moveTo(x + r, y); p.arcTo(x + w, y, x + w, y + h, r); p.arcTo(x + w, y + h, x, y + h, r);
+    p.arcTo(x, y + h, x, y, r); p.arcTo(x, y, x + w, y, r); p.closePath();
+    return p;
+  }
+  function paperBody(ctx, path, base, shade, lw = 3, ox = -4, oy = -5, drop = true) {
+    if (drop) { ctx.save(); ctx.translate(3, 4); ctx.fillStyle = C.paperShadow; ctx.fill(path); ctx.restore(); }
+    ctx.fillStyle = shade; ctx.fill(path);
+    ctx.save(); ctx.clip(path); ctx.translate(ox, oy); ctx.fillStyle = base; ctx.fill(path); ctx.restore();
+    ctx.lineWidth = lw; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.strokeStyle = C.ink; ctx.stroke(path);
+  }
+  function inkLine(ctx, build, color, w) {
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    build(); ctx.strokeStyle = C.ink; ctx.lineWidth = w + 3.5; ctx.stroke();
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.stroke();
+  }
+  function shadow(ctx, x, y, rx, a = 0.22) {
+    ctx.fillStyle = `rgba(42,35,64,${a})`; ctx.beginPath(); ctx.ellipse(x, y, rx, rx * 0.32, 0, 0, TAU); ctx.fill();
+  }
+  LG.art = { rr, rrPath, paperBody, inkLine, shadow, TAU };
+
+  // ---------- hero "Pip" ----------
+  const HERO_BODY = (() => {
+    const p = new Path2D();
+    p.moveTo(-20, -16); p.bezierCurveTo(-22, -42, -12, -52, 0, -52); p.bezierCurveTo(12, -52, 22, -42, 20, -16);
+    p.quadraticCurveTo(20, -8, 12, -8); p.lineTo(-12, -8); p.quadraticCurveTo(-20, -8, -20, -16); p.closePath();
+    return p;
+  })();
+  const LEAF = new Path2D('M0 0 Q5 -10 16 -7 Q9 2 0 0 Z');
+  const PETAL = (() => { const p = new Path2D(); p.ellipse(0, -7, 4.5, 6.5, 0, 0, TAU); return p; })();
+
+  function limb(ctx, a, fill) { ctx.beginPath(); ctx.arc(a.x, a.y, 4.5, 0, TAU); ctx.fillStyle = fill; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = C.ink; ctx.stroke(); }
+  function sprout(ctx, a, bloom) {
+    const by = -51, tx = Math.sin(a) * 15, ty = by - Math.cos(a) * 15;
+    inkLine(ctx, () => { ctx.beginPath(); ctx.moveTo(0, by); ctx.quadraticCurveTo(Math.sin(a) * 4, by - 9, tx, ty); }, C.sprout, 2.5);
+    ctx.save(); ctx.translate(tx, ty);
+    if (bloom <= 0) { ctx.rotate(a + 0.45); paperBody(ctx, LEAF, C.sprout, C.sproutShade, 2.5, -2, -2, false); }
+    else {
+      const k = easeOutBack(bloom); ctx.scale(k, k); ctx.rotate(bloom * 0.6);
+      for (let i = 0; i < 5; i++) { ctx.save(); ctx.rotate((i * TAU) / 5); paperBody(ctx, PETAL, C.bloom, C.bloomShade, 2, -1, -2, false); ctx.restore(); }
+      ctx.beginPath(); ctx.arc(0, 0, 4.5, 0, TAU); ctx.fillStyle = C.gold; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.ink; ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function eyes(ctx, kind, fx, ey, look, ry = 4.2) {
+    ctx.strokeStyle = C.ink; ctx.fillStyle = C.ink; ctx.lineWidth = 2.4; ctx.lineCap = 'round';
+    [fx - 4.5, fx + 4.5].forEach((x0, i) => {
+      const x = x0 + look * 1.5; ctx.beginPath();
+      if (kind === 'open') { ctx.ellipse(x, ey, 2.6, ry, 0, 0, TAU); ctx.fill(); ctx.fillStyle = '#FFF'; ctx.beginPath(); ctx.arc(x - 0.8, ey - 1.6, 1, 0, TAU); ctx.fill(); ctx.fillStyle = C.ink; }
+      else if (kind === 'blink') { ctx.moveTo(x - 2.8, ey); ctx.lineTo(x + 2.8, ey); ctx.stroke(); }
+      else if (kind === 'happy') { ctx.arc(x, ey + 1.5, 3, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke(); }
+      else if (kind === 'squeeze') { const s = i ? -1 : 1; ctx.moveTo(x - 2.5 * s, ey - 3); ctx.lineTo(x + 2 * s, ey); ctx.lineTo(x - 2.5 * s, ey + 3); ctx.stroke(); }
+    });
+  }
+  function mouth(ctx, kind, mx, my) {
+    ctx.lineWidth = 2.2; ctx.strokeStyle = C.ink; ctx.fillStyle = C.ink; ctx.beginPath();
+    if (kind === 'smile') { ctx.arc(mx, my - 1.5, 3, 0.2 * Math.PI, 0.8 * Math.PI); ctx.stroke(); }
+    else if (kind === 'open') { ctx.ellipse(mx, my, 2.2, 2.8, 0, 0, TAU); ctx.fill(); }
+    else if (kind === 'grin') { ctx.moveTo(mx - 4, my - 2); ctx.lineTo(mx + 4, my - 2); ctx.arc(mx, my - 2, 4, 0, Math.PI); ctx.fill(); }
+    else if (kind === 'wobble') { ctx.moveTo(mx - 3.5, my); for (let k = 1; k <= 4; k++) ctx.lineTo(mx - 3.5 + k * 1.75, my + (k % 2 ? -1.2 : 1.2)); ctx.stroke(); }
+  }
+  // h: {dir, phase, moving, state:'idle'|'run'|'carry'|'hurt'|'celebrate', st (state time), sproutA, flash, alpha, blink, look, front}
+  function drawHero(ctx, x, y, h, rm) {
+    const t = h.t;
+    let bob = 0, sx = 1, sy = 1, lean = 0, eyeK = h.blink ? 'blink' : 'open', mouthK = 'smile', bloom = 0;
+    let arms = [{ x: -20, y: -22 }, { x: 20, y: -22 }], feet = [{ x: -7, y: 0 }, { x: 7, y: 0 }];
+    if (h.state === 'run' || h.state === 'carry') {
+      const ph = h.phase;
+      feet = feet.map((f, i) => { const p = ph + i * Math.PI; return { x: (i ? 4 : -4) + Math.sin(p) * 7, y: -Math.max(0, Math.cos(p)) * 5 }; });
+      if (h.moving > 30) { arms[0].x = -20 + Math.sin(ph) * 3; arms[1].x = 20 - Math.sin(ph) * 3; bob = -Math.abs(Math.sin(ph)) * 2.5 * (rm ? 0.5 : 1); lean = 0.1; mouthK = 'open'; }
+      else feet = [{ x: -7, y: 0 }, { x: 7, y: 0 }];
+    }
+    if (h.state === 'idle' && !rm) { const s = Math.sin((t / 1.2) * TAU); bob = s * 1.2; sy = 1 + s * 0.025; sx = 1 - s * 0.025; }
+    if (h.state === 'carry') arms = [{ x: -14, y: -50 }, { x: 14, y: -50 }];
+    if (h.state === 'hurt') { eyeK = 'squeeze'; mouthK = 'wobble'; }
+    if (h.state === 'celebrate') {
+      bob = rm ? 0 : -Math.abs(Math.sin((h.st / 0.28) * Math.PI)) * (h.st < 0.56 ? 14 : 0);
+      eyeK = 'happy'; mouthK = 'grin'; arms = [{ x: -22, y: -46 }, { x: 22, y: -46 }]; bloom = rm ? 1 : Math.min(1, h.st / 0.42);
+    }
+    sy *= h.squash || 1; sx /= h.squash || 1;
+    shadow(ctx, x, y, 18, 0.22 * ctx.globalAlpha);
+    ctx.save();
+    const a0 = ctx.globalAlpha * (h.alpha == null ? 1 : h.alpha);
+    ctx.globalAlpha = a0;
+    ctx.translate(x, y + bob); ctx.scale(h.dir, 1); ctx.rotate(lean); ctx.scale(sx, sy);
+    limb(ctx, arms[0], C.heroShade);
+    ctx.fillStyle = C.ink;
+    for (const f of feet) { ctx.beginPath(); ctx.ellipse(f.x, -4 + f.y, 6.5, 4, 0, 0, TAU); ctx.fill(); }
+    paperBody(ctx, HERO_BODY, h.flash ? '#FFF' : C.hero, h.flash ? '#FFF' : C.heroShade, 3, -4 * h.dir, -5, false);
+    const fx = 6 + (h.look || 0) * 2;
+    ctx.fillStyle = C.cream; ctx.beginPath(); ctx.ellipse(fx, -33, 12.5, 10, 0, 0, TAU); ctx.fill();
+    eyes(ctx, eyeK, fx, -34, h.look || 0);
+    mouth(ctx, mouthK, fx + 1, -27);
+    ctx.globalAlpha = a0 * 0.8; ctx.fillStyle = C.cheek; ctx.beginPath(); ctx.arc(fx + 10, -26, 3, 0, TAU); ctx.fill();
+    ctx.globalAlpha = a0;
+    limb(ctx, arms[1], C.hero);
+    if (h.hat) drawHat(ctx, h.hat); else sprout(ctx, h.sproutA || 0, bloom);
+    ctx.restore();
+  }
+  // hats earned with stars; drawn in hero space (top of head at y ≈ -52)
+  function drawHat(ctx, k) {
+    ctx.save(); ctx.translate(0, -50);
+    if (k === 1) { // flower crown
+      for (let i = 0; i < 5; i++) { const a = Math.PI + (i / 4) * Math.PI; ctx.save(); ctx.translate(Math.cos(a) * 16, Math.sin(a) * 6 + 2); ctx.scale(0.55, 0.55); for (let j = 0; j < 5; j++) { ctx.save(); ctx.rotate((j * TAU) / 5); paperBody(ctx, PETAL, [C.bloom, C.gold, '#FFFFFF', '#9FD8FF', C.bloom][i], C.bloomShade, 2, -1, -1, false); ctx.restore(); } ctx.restore(); }
+    } else if (k === 2) { // leaf cap
+      const p = new Path2D(); p.ellipse(0, 0, 21, 10, 0, Math.PI, TAU); p.lineTo(21, 2); p.lineTo(-21, 2); p.closePath();
+      paperBody(ctx, p, C.sprout, C.sproutShade, 3, -2, -2, false);
+      ctx.save(); ctx.translate(2, -10); ctx.rotate(-0.6); paperBody(ctx, LEAF, C.sprout, C.sproutShade, 2.5, -1, -1, false); ctx.restore();
+    } else if (k === 3) { // gold crown
+      const p = new Path2D('M-17 4 L-19 -14 L-9 -6 L0 -20 L9 -6 L19 -14 L17 4 Z');
+      ctx.lineJoin = 'round'; paperBody(ctx, p, C.gold, C.goldShade, 3, -2, -2, false);
+      for (const [x, y] of [[-19, -15], [0, -21], [19, -15]]) { ctx.beginPath(); ctx.arc(x, y, 3.2, 0, TAU); ctx.fillStyle = C.bloom; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.ink; ctx.stroke(); }
+    } else if (k === 4) { // bobble beanie
+      const p = new Path2D(); p.ellipse(0, 0, 20, 15, 0, Math.PI, TAU); p.closePath();
+      paperBody(ctx, p, '#5BC0F8', '#3B97D3', 3, -2, -2, false);
+      const band = rrPath(-21, -3, 42, 8, 4); paperBody(ctx, band, '#FFFFFF', '#D5E3EE', 2.5, -1, -1, false);
+      const b = new Path2D(); b.arc(0, -17, 6, 0, TAU); paperBody(ctx, b, '#FFFFFF', '#D5E3EE', 2.5, -1, -1, false);
+    } else if (k === 5) { // propeller cap
+      const p = new Path2D(); p.ellipse(0, 0, 19, 12, 0, Math.PI, TAU); p.closePath();
+      paperBody(ctx, p, C.teal, C.tealShade, 3, -2, -2, false);
+      ctx.fillStyle = C.gold; ctx.strokeStyle = C.ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, -12); ctx.lineTo(0, -17); ctx.stroke();
+      const sp = Math.sin(Date.now() / 60) ; ctx.beginPath(); ctx.ellipse(0, -18, 16 * Math.abs(sp) + 2, 3, 0, 0, TAU); ctx.fillStyle = C.bloom; ctx.fill(); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  LG.art.drawHero = drawHero; LG.art.drawHat = drawHat;
+
+  // ---------- grumps (all danger: dark, spiky, coral eyes) ----------
+  function spikyPath(r, n, spike, wob) {
+    const p = new Path2D();
+    for (let i = 0; i <= n * 2; i++) {
+      const a = -Math.PI / 2 + (i * Math.PI) / n;
+      const d = i % 2 ? r : r + spike + (wob ? wob(i) : 0);
+      const x = Math.cos(a) * d, y = Math.sin(a) * d * 0.92;
+      i ? p.lineTo(x, y) : p.moveTo(x, y);
+    }
+    p.closePath(); return p;
+  }
+  const PATHS = {};
+  function grumpPath(r, n) { const k = r + ':' + n; return PATHS[k] || (PATHS[k] = spikyPath(r, n, r * 0.42)); }
+
+  // e: enemy, t time, rm reduced motion
+  function drawGrump(ctx, e, t, rm) {
+    const r = e.r;
+    if (!e.alive) return;
+    let jx = 0, jy = 0, sc = 1;
+    const step = Math.floor(t * 8 + e.id) % 2; // stepped motion = danger
+    if (e.kind === 'sleepy') sc = 1 + (rm ? 0 : Math.sin(t * 2.2 + e.id) * 0.04);
+    else if (e.kind === 'dasher' && e.st === 'wind') { jx = rm ? 0 : (step ? 2.5 : -2.5); sc = 1.08; }
+    else if (e.kind !== 'sleepy' && (e.st !== 'dizzy')) jy = step ? -2 : 0;
+    shadow(ctx, e.x, e.y + r * 0.75, r * 1.05, 0.25);
+    ctx.save();
+    ctx.translate(e.x + jx, e.y + jy);
+    if (e.kind === 'dasher' && e.st === 'dash') { const a = Math.atan2(e.dy, e.dx); ctx.rotate(a * 0.15); ctx.scale(1.12, 0.9); }
+    ctx.scale(sc, sc);
+    if (e.kind !== 'sleepy') {
+      // stubby feet that step (stiff, two-frame: danger moves mechanically)
+      ctx.fillStyle = C.ink;
+      for (const sd of [-1, 1]) { const lift = (step ? sd : -sd) > 0 ? -3 : 0; ctx.beginPath(); ctx.ellipse(sd * r * 0.45, r * 0.78 + lift, r * 0.22, r * 0.13, 0, 0, TAU); ctx.fill(); }
+    }
+    if (e.kind === 'dasher') {
+      // a forward horn: the one that charges
+      ctx.save(); ctx.fillStyle = '#E8E1D2'; ctx.strokeStyle = C.ink; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(-r * 0.25, -r * 0.7); ctx.quadraticCurveTo(0, -r * 1.9, r * 0.35, -r * 1.6); ctx.quadraticCurveTo(r * 0.15, -r * 1.1, r * 0.25, -r * 0.7); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
+    }
+    const body = grumpPath(r, e.kind === 'big' ? 11 : 8);
+    ctx.fillStyle = C.danger; ctx.fill(body);
+    ctx.lineWidth = 3; ctx.lineJoin = 'miter'; ctx.strokeStyle = C.ink; ctx.stroke(body);
+    ctx.fillStyle = C.dangerFacet; ctx.beginPath(); ctx.ellipse(-r * 0.38, -r * 0.42, r * 0.36, r * 0.16, -0.5, 0, TAU); ctx.fill();
+    // cutter: two scissor claws
+    if (e.kind === 'cutter') {
+      const open = rm ? 0.4 : 0.25 + Math.abs(Math.sin(t * 6)) * 0.45;
+      for (const s of [-1, 1]) {
+        ctx.save(); ctx.translate(s * r * 1.05, r * 0.15);
+        for (const k of [-1, 1]) {
+          ctx.save(); ctx.rotate(s * (0.2 + k * open * 0.5));
+          ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(s * 16, -3); ctx.lineTo(0, 4); ctx.closePath();
+          ctx.fillStyle = '#C9CED8'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.ink; ctx.stroke(); ctx.restore();
+        }
+        ctx.beginPath(); ctx.arc(0, 0, 3.5, 0, TAU); ctx.fillStyle = C.danger; ctx.fill(); ctx.stroke();
+        ctx.restore();
+      }
+    }
+    // face
+    const ey = -r * 0.12, ex = r * 0.34;
+    if (e.kind === 'sleepy') {
+      ctx.strokeStyle = C.dangerEye; ctx.lineWidth = 2.6; ctx.lineCap = 'round';
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.arc(s * ex, ey, r * 0.16, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke(); }
+    } else if (e.kind === 'dasher' && e.st === 'dizzy') {
+      ctx.strokeStyle = C.dangerEye; ctx.lineWidth = 2.2;
+      for (const s of [-1, 1]) { ctx.beginPath(); for (let k = 0; k < 14; k++) { const a = k * 0.9 + t * 9, d = k * 0.45; ctx.lineTo(s * ex + Math.cos(a) * d, ey + Math.sin(a) * d); } ctx.stroke(); }
+    } else {
+      ctx.fillStyle = C.dangerEye;
+      const look = e.kind === 'dasher' && e.st === 'wind' ? 1.4 : 1;
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.ellipse(s * ex + (e.vx || 0) * 2, ey, r * 0.14 * look, r * 0.18 * look, 0, 0, TAU); ctx.fill(); }
+      ctx.strokeStyle = C.dangerEye; ctx.lineWidth = 2.4; ctx.lineCap = 'round';
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.moveTo(s * ex * 1.7, ey - r * 0.38); ctx.lineTo(s * ex * 0.4, ey - r * 0.2); ctx.stroke(); }
+    }
+    ctx.restore();
+    // sleepy Z bubbles (rounded, not letters: little growing rings)
+    if (e.kind === 'sleepy' && !rm) {
+      for (let k = 0; k < 3; k++) {
+        const ph = ((t * 0.5 + k / 3) % 1);
+        ctx.globalAlpha = 1 - ph; ctx.strokeStyle = C.ink; ctx.lineWidth = 2; ctx.fillStyle = '#FFF';
+        ctx.beginPath(); ctx.arc(e.x + r * 0.8 + ph * 14, e.y - r - ph * 30, 3 + ph * 4, 0, TAU); ctx.fill(); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    if ((e.kind === 'chaser' || e.kind === 'big') && e.st === 'chase') {
+      // anger puff: a jagged coral burst above the head while it hunts you
+      ctx.save(); ctx.translate(e.x + r * 0.7, e.y - r * 1.25); ctx.rotate(rm ? 0 : Math.sin(t * 20) * 0.15);
+      ctx.beginPath(); for (let k = 0; k < 8; k++) { const a = (k / 8) * TAU, d = k % 2 ? 4 : 9; ctx.lineTo(Math.cos(a) * d, Math.sin(a) * d); } ctx.closePath();
+      ctx.fillStyle = C.dangerEye; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.ink; ctx.stroke(); ctx.restore();
+    }
+    if (e.kind === 'chaser' || e.kind === 'big') {
+      // chasers wear a darker crest of extra spikes so they read differently from walkers
+      ctx.save(); ctx.translate(e.x, e.y - r * 0.95); ctx.fillStyle = C.danger; ctx.strokeStyle = C.ink; ctx.lineWidth = 2;
+      for (const dx of [-8, 0, 8]) { ctx.beginPath(); ctx.moveTo(dx - 5, 4); ctx.lineTo(dx, dx ? -8 : -13); ctx.lineTo(dx + 5, 4); ctx.closePath(); ctx.fill(); ctx.stroke(); }
+      ctx.restore();
+    }
+    if (e.kind === 'dasher' && e.st === 'dizzy') {
+      for (let k = 0; k < 3; k++) { const a = t * 4 + (k * TAU) / 3; drawStar(ctx, e.x + Math.cos(a) * r, e.y - r * 1.2 + Math.sin(a) * 5, 0.32); }
+    }
+    if (e.kind === 'dasher' && e.st === 'wind' && e.ax !== undefined) {
+      // a dotted line telegraphs where it will charge
+      const L = Math.hypot(e.ax, e.ay) || 1;
+      ctx.save(); ctx.setLineDash([2, 12]); ctx.lineCap = 'round'; ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(255,77,94,0.55)';
+      ctx.beginPath(); ctx.moveTo(e.x, e.y); ctx.lineTo(e.x + (e.ax / L) * 300, e.y + (e.ay / L) * 300); ctx.stroke(); ctx.restore();
+    }
+  }
+  LG.art.drawGrump = drawGrump;
+
+  // ---------- collectibles ----------
+  function roundedStar(R, r, round) {
+    const pts = []; for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + (i * Math.PI) / 5, d = i % 2 ? r : R; pts.push([Math.cos(a) * d, Math.sin(a) * d]); }
+    const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], p = new Path2D(), m0 = mid(pts[9], pts[0]);
+    p.moveTo(m0[0], m0[1]);
+    for (let i = 0; i < 10; i++) { const c = pts[i], m = mid(c, pts[(i + 1) % 10]); p.arcTo(c[0], c[1], m[0], m[1], i % 2 ? round * 0.6 : round); }
+    p.closePath(); return p;
+  }
+  const STAR = roundedStar(18, 8.5, 3.5);
+  function drawStar(ctx, x, y, s, empty) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    if (empty) { ctx.fillStyle = 'rgba(255,244,220,0.85)'; ctx.fill(STAR); ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(42,35,64,0.4)'; ctx.stroke(STAR); }
+    else { paperBody(ctx, STAR, C.gold, C.goldShade, 3, -3, -4, false); ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.beginPath(); ctx.ellipse(-5, -6, 3.2, 1.8, -0.6, 0, TAU); ctx.fill(); }
+    ctx.restore();
+  }
+  function drawStarSeed(ctx, s, t, rm) {
+    const y = s.y + (rm ? 0 : Math.sin(t * 5.7 + s.x) * 3);
+    shadow(ctx, s.x, s.y + 22, 12, 0.15);
+    ctx.save(); ctx.translate(s.x, y);
+    ctx.beginPath(); ctx.arc(0, 0, 24, 0, TAU); ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(42,35,64,0.35)'; ctx.stroke();
+    ctx.rotate(rm ? 0 : (t / 6) * TAU);
+    drawStar(ctx, 0, 0, 0.95);
+    ctx.restore();
+  }
+  LG.art.drawStar = drawStar; LG.art.drawStarSeed = drawStarSeed;
+
+  // ---------- items (carried & wanted) ----------
+  function drawItem(ctx, kind, x, y, s) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    if (kind === 'apple') {
+      const p = new Path2D(); p.moveTo(0, -9); p.bezierCurveTo(10, -16, 18, -4, 13, 6); p.bezierCurveTo(9, 15, 3, 14, 0, 12);
+      p.bezierCurveTo(-3, 14, -9, 15, -13, 6); p.bezierCurveTo(-18, -4, -10, -16, 0, -9); p.closePath();
+      paperBody(ctx, p, '#F2495C', '#C42F43', 3, -3, -3, false);
+      inkLine(ctx, () => { ctx.beginPath(); ctx.moveTo(0, -9); ctx.quadraticCurveTo(1, -14, 3, -17); }, '#8A4F26', 2.5);
+      ctx.save(); ctx.translate(3, -14); ctx.rotate(-0.3); ctx.scale(0.7, 0.7); paperBody(ctx, LEAF, C.sprout, C.sproutShade, 3, -1, -1, false); ctx.restore();
+      ctx.fillStyle = 'rgba(255,255,255,0.8)'; ctx.beginPath(); ctx.ellipse(-7, -3, 2.5, 4, 0.4, 0, TAU); ctx.fill();
+    } else if (kind === 'fish') {
+      const p = new Path2D(); p.moveTo(-16, 0); p.bezierCurveTo(-8, -12, 8, -11, 12, 0); p.bezierCurveTo(8, 11, -8, 12, -16, 0); p.closePath();
+      const tail = new Path2D(); tail.moveTo(10, 0); tail.lineTo(20, -9); tail.quadraticCurveTo(17, 0, 20, 9); tail.closePath();
+      paperBody(ctx, tail, '#5BC0F8', '#3B97D3', 2.5, -1, -1, false);
+      paperBody(ctx, p, '#5BC0F8', '#3B97D3', 3, -2, -3, false);
+      ctx.fillStyle = C.ink; ctx.beginPath(); ctx.arc(-9, -2, 2.2, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#FFF'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(-1, 0, 6, -1, 1); ctx.stroke();
+    } else if (kind === 'key') {
+      const ring = new Path2D(); ring.arc(-8, 0, 8, 0, TAU);
+      const bar = rrPath(-2, -3, 22, 6, 3);
+      paperBody(ctx, bar, C.teal, C.tealShade, 2.5, -1, -1, false);
+      ctx.fillStyle = C.teal; ctx.strokeStyle = C.ink; ctx.lineWidth = 2.5;
+      for (const bx of [12, 17]) { ctx.beginPath(); ctx.rect(bx, 2, 4, 6); ctx.fill(); ctx.stroke(); }
+      paperBody(ctx, ring, C.teal, C.tealShade, 3, -2, -2, false);
+      ctx.fillStyle = '#E8F7FC'; ctx.beginPath(); ctx.arc(-8, 0, 3.2, 0, TAU); ctx.fill(); ctx.stroke();
+    } else if (kind === 'heart') {
+      const p = new Path2D('M0 12 C-18 -2 -18 -16 -9 -18 C-4 -19 0 -14 0 -10 C0 -14 4 -19 9 -18 C18 -16 18 -2 0 12 Z');
+      paperBody(ctx, p, C.heart, '#D93A68', 3, -2, -3, false);
+      ctx.fillStyle = 'rgba(255,255,255,0.8)'; ctx.beginPath(); ctx.ellipse(-8, -10, 3, 2, -0.6, 0, TAU); ctx.fill();
+    } else if (kind === 'spool') {
+      // golden ribbon spool: grab it for a longer ribbon
+      const body = rrPath(-12, -14, 24, 28, 6);
+      paperBody(ctx, body, C.gold, C.goldShade, 3, -2, -2, false);
+      ctx.strokeStyle = '#FFF6C9'; ctx.lineWidth = 2; for (let y = -8; y <= 8; y += 5) { ctx.beginPath(); ctx.moveTo(-10, y); ctx.lineTo(10, y + 2); ctx.stroke(); }
+      for (const y of [-16, 16]) { const cap = rrPath(-16, y - 3, 32, 6, 3); paperBody(ctx, cap, C.plank, C.plankShade, 2.5, -1, -1, false); }
+      inkLine(ctx, () => { ctx.beginPath(); ctx.moveTo(12, 6); ctx.quadraticCurveTo(24, 10, 20, 22); }, C.gold, 3);
+    } else if (kind === 'chick') {
+      drawChick(ctx, 0, 8, 1, 0, false);
+    }
+    ctx.restore();
+  }
+  LG.art.drawItem = drawItem;
+
+  // ---------- friends (all lilac, all round) ----------
+  function npcFace(ctx, mood, x, y, s) {
+    ctx.lineWidth = 2.4; ctx.strokeStyle = C.ink; ctx.fillStyle = C.ink; ctx.lineCap = 'round';
+    for (const ex of [-6 * s, 6 * s]) {
+      ctx.beginPath();
+      if (mood === 'happy') { ctx.arc(x + ex, y, 3.2, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke(); continue; }
+      ctx.ellipse(x + ex, y, 2.8, 4, 0, 0, TAU); ctx.fill();
+      if (mood === 'needs') { const sd = ex < 0 ? 1 : -1; ctx.beginPath(); ctx.moveTo(x + ex - 3 * sd, y - 6); ctx.lineTo(x + ex + 3 * sd, y - 8.5); ctx.stroke(); }
+    }
+    ctx.beginPath();
+    if (mood === 'needs') { ctx.arc(x, y + 10, 3.5, 1.15 * Math.PI, 1.85 * Math.PI); ctx.stroke(); }
+    else { ctx.arc(x, y + 6, 4, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke(); }
+  }
+  function drawNpc(ctx, n, t, rm, hopT) {
+    const needs = !n.done, happy = n.done;
+    const sway = needs && !rm ? Math.sin(t * 7) * 0.035 : 0;
+    const hop = happy && !rm && hopT < 1 ? Math.abs(Math.sin((hopT / 0.32) * Math.PI)) * 10 : 0;
+    const body = needs ? C.npcSad : C.npc;
+    shadow(ctx, n.x, n.y + 18, 26);
+    ctx.save(); ctx.translate(n.x, n.y + 18 - hop); ctx.rotate(sway);
+    const mood = needs ? 'needs' : 'happy';
+    if (n.who === 'bunny') {
+      const earA = needs ? 1.0 : 0.15;
+      for (const s of [-1, 1]) {
+        ctx.save(); ctx.translate(s * 13, -40); ctx.rotate(s * earA);
+        paperBody(ctx, rrPath(-6, -30, 12, 32, 6), body, C.npcShade, 3, -2, -3, false);
+        ctx.fillStyle = C.npcInner; ctx.beginPath(); rr(ctx, -2.5, -26, 5, 20, 2.5); ctx.fill(); ctx.restore();
+      }
+      const b = new Path2D(); b.ellipse(0, -24, 30, 24, 0, 0, TAU);
+      paperBody(ctx, b, body, C.npcShade, 3, -4, -5, false);
+      ctx.fillStyle = C.cream; ctx.beginPath(); ctx.ellipse(0, -14, 15, 10, 0, 0, TAU); ctx.fill();
+      npcFace(ctx, mood, 0, -30, 1);
+    } else if (n.who === 'frog') {
+      for (const s of [-1, 1]) { const e = new Path2D(); e.arc(s * 14, -40, 10, 0, TAU); paperBody(ctx, e, body, C.npcShade, 3, -2, -2, false); }
+      const b = new Path2D(); b.ellipse(0, -20, 32, 21, 0, 0, TAU);
+      paperBody(ctx, b, body, C.npcShade, 3, -4, -5, false);
+      ctx.fillStyle = C.cream; ctx.beginPath(); ctx.ellipse(0, -10, 18, 8, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = C.cream; for (const s of [-1, 1]) { ctx.beginPath(); ctx.arc(s * 14, -40, 5.5, 0, TAU); ctx.fill(); }
+      npcFace(ctx, mood, 0, -40, 2.3);
+    } else if (n.who === 'hen') {
+      const comb = new Path2D(); comb.arc(-5, -50, 6, 0, TAU); comb.arc(5, -52, 6, 0, TAU);
+      paperBody(ctx, comb, C.bloom, C.bloomShade, 2.5, -1, -1, false);
+      const b = new Path2D(); b.ellipse(0, -24, 27, 26, 0, 0, TAU);
+      paperBody(ctx, b, body, C.npcShade, 3, -4, -5, false);
+      ctx.fillStyle = C.gold; ctx.strokeStyle = C.ink; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(-4, -24); ctx.lineTo(4, -24); ctx.lineTo(0, -17); ctx.closePath(); ctx.fill(); ctx.stroke();
+      npcFace(ctx, mood, 0, -32, 1.2);
+      for (const s of [-1, 1]) { const w = new Path2D(); w.ellipse(s * 26, -20, 7, 13, s * 0.4, 0, TAU); paperBody(ctx, w, body, C.npcShade, 2.5, -1, -1, false); }
+    }
+    ctx.restore();
+    if (needs && n.want) drawBubble(ctx, n.x + 10, n.y - 76, n.want, t, rm);
+  }
+  function drawBubble(ctx, x, y, item, t, rm) {
+    const bob = rm ? 0 : Math.sin(t * 4.5) * 3;
+    const pulse = rm ? 1 : 1 + 0.07 * Math.max(0, Math.sin(t * Math.PI)) ** 8;
+    ctx.save(); ctx.translate(x, y + bob);
+    for (const [dx, dy, r] of [[-10, 34, 5], [-16, 46, 3.5]]) { ctx.beginPath(); ctx.arc(dx, dy, r, 0, TAU); ctx.fillStyle = '#FFF'; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = C.ink; ctx.stroke(); }
+    ctx.scale(pulse, pulse);
+    ctx.beginPath(); ctx.arc(0, 0, 25, 0, TAU); ctx.fillStyle = '#FFF'; ctx.fill(); ctx.lineWidth = 3; ctx.stroke();
+    drawItem(ctx, item, 0, 0, 0.95);
+    ctx.restore();
+  }
+  function drawChick(ctx, x, y, s, t, scared) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    const b = new Path2D(); b.ellipse(0, -12, 13, 12, 0, 0, TAU);
+    paperBody(ctx, b, '#FFE07A', '#E6B94A', 2.5, -2, -3, false);
+    ctx.fillStyle = '#FF9A3C'; ctx.strokeStyle = C.ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(5, -13); ctx.lineTo(13, -11); ctx.lineTo(5, -8); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = C.ink; ctx.beginPath();
+    if (scared) { ctx.lineWidth = 2; ctx.moveTo(-1, -18); ctx.lineTo(4, -15); ctx.lineTo(-1, -12); ctx.stroke(); }
+    else { ctx.arc(2, -15, 2, 0, TAU); ctx.fill(); }
+    ctx.restore();
+  }
+  LG.art.drawNpc = drawNpc; LG.art.drawChick = drawChick; LG.art.drawBubble = drawBubble;
+  LG.art.drawNpcIcon = function (ctx, who, x, y, s, done) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    drawNpc(ctx, { who, x: 0, y: 0, done: !!done, want: null }, 0, true, 9);
+    ctx.restore();
+  };
+
+  // ---------- world props ----------
+  function drawBud(ctx, b, t, rm) {
+    // teal bud = "use me": circle it
+    shadow(ctx, b.x, b.y + 14, 16);
+    ctx.save(); ctx.translate(b.x, b.y + 14);
+    inkLine(ctx, () => { ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(4, -12, 0, -22); }, C.stem, 4);
+    for (const s of [-1, 1]) { ctx.save(); ctx.translate(0, -8); ctx.rotate(s > 0 ? -0.4 : Math.PI + 0.4); ctx.scale(0.8, 0.8); paperBody(ctx, LEAF, C.sprout, C.sproutShade, 2.5, -1, -1, false); ctx.restore(); }
+    ctx.translate(0, -24);
+    if (!b.open) {
+      const br = rm ? 1 : 1 + Math.sin(t * 6.3) * 0.04;
+      ctx.scale(br, br);
+      const bud = new Path2D('M0 6 C-12 2 -11 -18 0 -26 C11 -18 12 2 0 6 Z');
+      paperBody(ctx, bud, C.teal, C.tealShade, 3, -2, -3, false);
+    } else {
+      const k = easeOutBack(clamp(b.anim, 0, 1));
+      ctx.scale(k, k);
+      for (let i = 0; i < 6; i++) { ctx.save(); ctx.rotate((i * TAU) / 6); const p = new Path2D(); p.ellipse(0, -13, 7, 11, 0, 0, TAU); paperBody(ctx, p, C.bloom, C.bloomShade, 2.5, -2, -3, false); ctx.restore(); }
+      ctx.beginPath(); ctx.arc(0, 0, 7, 0, TAU); ctx.fillStyle = C.gold; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = C.ink; ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function drawCage(ctx, c, t, rm, inside) {
+    const k = c.open ? clamp(c.anim, 0, 1) : 0;
+    shadow(ctx, c.x, c.y + 26, 30);
+    if (inside) inside();
+    if (k >= 1) return;
+    ctx.save(); ctx.translate(c.x, c.y - k * 30); ctx.globalAlpha = 1 - k;
+    // wooden cage with teal ring = "circle it"
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 3;
+    for (let i = -2; i <= 2; i++) inkLine(ctx, () => { ctx.beginPath(); ctx.moveTo(i * 11, -36); ctx.lineTo(i * 11, 24); }, C.plank, 3.5);
+    const top = rrPath(-30, -44, 60, 12, 6), bot = rrPath(-30, 20, 60, 10, 5);
+    paperBody(ctx, top, C.plank, C.plankShade, 3, -2, -2, false);
+    paperBody(ctx, bot, C.plank, C.plankShade, 3, -2, -2, false);
+    const lock = new Path2D(); lock.arc(0, -4, 8, 0, TAU);
+    paperBody(ctx, lock, C.teal, C.tealShade, 2.5, -1, -1, false);
+    ctx.restore();
+  }
+  function drawLantern(ctx, l, t, rm) {
+    const k = l.lit ? (rm ? 1 : clamp(l.k || 0, 0, 1)) : 0;
+    const sway = rm ? 0 : Math.sin(t * 3.7 + l.x * 0.01) * 0.04;
+    shadow(ctx, l.x, l.y + 4, 12);
+    ctx.save(); ctx.translate(l.x, l.y + 4);
+    inkLine(ctx, () => { ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(5, -24, 0, -46); }, C.stem, 4);
+    ctx.translate(0, -48); ctx.rotate(sway);
+    if (k < 1) { ctx.save(); ctx.scale(1 - k, 1 - k); paperBody(ctx, new Path2D('M0 4 C-9 0 -8 -14 0 -20 C8 -14 9 0 0 4 Z'), C.bud, C.budShade, 3, -2, -3, true); ctx.restore(); }
+    if (k > 0) {
+      const e = easeOutBack(k);
+      for (let i = 0; i < 6; i++) { ctx.save(); ctx.rotate((i * TAU) / 6 + (1 - k) * 0.8); ctx.scale(e, e); const p = new Path2D(); p.ellipse(0, -13, 7, 11, 0, 0, TAU); paperBody(ctx, p, C.bloom, C.bloomShade, 2.5, -2, -3, false); ctx.restore(); }
+      ctx.beginPath(); ctx.arc(0, 0, 7 * e, 0, TAU); ctx.fillStyle = C.gold; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = C.ink; ctx.stroke();
+    }
+    ctx.restore();
+  }
+  const ARCH = (() => { const p = new Path2D(); p.moveTo(-30, 0); p.lineTo(-30, -56); p.arc(0, -56, 30, Math.PI, 0); p.lineTo(30, 0); p.closePath(); return p; })();
+  function drawSunDoor(ctx, x, y, open, openK, t, rm) {
+    ctx.save(); ctx.translate(x, y);
+    ctx.save(); ctx.translate(0, -56); ctx.rotate(open && !rm ? (t / 12) * TAU : 0); ctx.lineCap = 'round';
+    for (let i = 0; i < 12; i++) {
+      ctx.rotate(TAU / 12);
+      ctx.strokeStyle = open ? `rgba(255,226,122,${0.85 * openK})` : 'rgba(42,35,64,0.12)';
+      ctx.lineWidth = i % 2 ? 7 : 10; ctx.beginPath(); ctx.moveTo(0, -44); ctx.lineTo(0, i % 2 ? -66 : -80); ctx.stroke();
+    }
+    ctx.restore();
+    paperBody(ctx, ARCH, C.doorFrame, '#6E3C1B', 3, -3, -4, true);
+    ctx.save(); ctx.scale(0.8, 0.86); ctx.translate(0, -2);
+    ctx.fillStyle = C.doorLight; ctx.fill(ARCH);
+    ctx.save(); ctx.translate(-30, 0); ctx.scale(1 - openK * 0.92, 1); ctx.translate(30, 0);
+    paperBody(ctx, ARCH, C.doorWood, '#93582B', 2.5, -3, -4, false);
+    ctx.restore(); ctx.restore();
+    ctx.restore();
+  }
+  function drawLockGlyph(c, s) {
+    c.save(); c.lineWidth = s * 0.22; c.strokeStyle = C.ink; c.lineCap = 'round';
+    c.beginPath(); c.arc(0, -s * 0.2, s * 0.42, Math.PI, 0); c.lineTo(s * 0.42, s * 0.05); c.moveTo(-s * 0.42, -s * 0.2); c.lineTo(-s * 0.42, s * 0.05); c.stroke();
+    c.beginPath(); rr(c, -s * 0.7, 0, s * 1.4, s * 1.0, s * 0.22); c.fillStyle = C.gold; c.fill(); c.lineWidth = s * 0.14; c.stroke();
+    c.beginPath(); c.arc(0, s * 0.42, s * 0.14, 0, TAU); c.fillStyle = C.ink; c.fill(); c.restore();
+  }
+  function drawFlower(ctx, x, y, hue, s) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    const cols = [[C.bloom, C.bloomShade], ['#FFE27A', '#E8B84A'], ['#FFFFFF', '#E6DCEF'], ['#9FD8FF', '#6CB6E6']][hue % 4];
+    for (let i = 0; i < 5; i++) { ctx.save(); ctx.rotate((i * TAU) / 5); ctx.beginPath(); ctx.ellipse(0, -6, 4, 6, 0, 0, TAU); ctx.fillStyle = cols[0]; ctx.fill(); ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(42,35,64,0.5)'; ctx.stroke(); ctx.restore(); }
+    ctx.beginPath(); ctx.arc(0, 0, 3.2, 0, TAU); ctx.fillStyle = C.gold; ctx.fill();
+    ctx.restore();
+  }
+  function drawHeart(ctx, x, y, s) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    const p = new Path2D('M0 6 C-10 -2 -10 -10 -5 -11 C-2 -12 0 -9 0 -7 C0 -9 2 -12 5 -11 C10 -10 10 -2 0 6 Z');
+    paperBody(ctx, p, C.heart, '#D93A68', 2, -1, -1, false);
+    ctx.restore();
+  }
+  Object.assign(LG.art, { drawBud, drawCage, drawLantern, drawSunDoor, drawLockGlyph, drawFlower, drawHeart, roundedStar, LEAF });
+
+  // ---------- scenery (never outlined: only gameplay has ink) ----------
+  function drawScenery(ctx, d, th, t, rm) {
+    const s = d.s;
+    switch (d.k) {
+      case 'tuft': ctx.fillStyle = th.deep; ctx.beginPath(); ctx.ellipse(d.x, d.y, 9 * s, 4 * s, 0, 0, TAU); ctx.fill(); ctx.fillStyle = th.light; ctx.beginPath(); ctx.ellipse(d.x - 2, d.y - 2, 5 * s, 2 * s, 0, 0, TAU); ctx.fill(); break;
+      case 'snowtuft': ctx.fillStyle = '#B9CFDD'; ctx.beginPath(); ctx.ellipse(d.x, d.y, 9 * s, 4 * s, 0, 0, TAU); ctx.fill(); ctx.fillStyle = '#FFFFFF'; ctx.beginPath(); ctx.ellipse(d.x - 2, d.y - 2, 6 * s, 2.5 * s, 0, 0, TAU); ctx.fill(); break;
+      case 'flower': ctx.globalAlpha = 0.6; drawFlower(ctx, d.x, d.y, d.h, 0.55 * s); ctx.globalAlpha = 1; break;
+      case 'clover': ctx.fillStyle = th.deep; for (let i = 0; i < 3; i++) { const a = (i * TAU) / 3 + d.h; ctx.beginPath(); ctx.arc(d.x + Math.cos(a) * 4 * s, d.y + Math.sin(a) * 4 * s, 4 * s, 0, TAU); ctx.fill(); } break;
+      case 'pebble': ctx.fillStyle = 'rgba(42,35,64,0.10)'; ctx.beginPath(); ctx.ellipse(d.x + 1, d.y + 2, 7 * s, 4 * s, 0, 0, TAU); ctx.fill(); ctx.fillStyle = '#D9D2C3'; ctx.beginPath(); ctx.ellipse(d.x, d.y, 7 * s, 4.5 * s, 0.3, 0, TAU); ctx.fill(); ctx.fillStyle = '#EEE9DE'; ctx.beginPath(); ctx.ellipse(d.x - 2, d.y - 1.5, 3 * s, 1.6 * s, 0.3, 0, TAU); ctx.fill(); break;
+      case 'petals': ctx.fillStyle = '#FFC4DA'; for (let i = 0; i < 4; i++) { const a = d.h + i * 1.7; ctx.beginPath(); ctx.ellipse(d.x + Math.cos(a) * 9 * s, d.y + Math.sin(a) * 5 * s, 3.2 * s, 2 * s, a, 0, TAU); ctx.fill(); } break;
+      case 'fruit': ctx.globalAlpha = 0.7; ctx.fillStyle = ['#F2A0A0', '#FFD27A', '#C9E07A', '#F2A0A0'][d.h]; ctx.beginPath(); ctx.arc(d.x, d.y, 4.5 * s, 0, TAU); ctx.fill(); ctx.globalAlpha = 1; break;
+      case 'puddle': ctx.fillStyle = 'rgba(108,199,234,0.35)'; ctx.beginPath(); ctx.ellipse(d.x, d.y, 18 * s, 8 * s, 0, 0, TAU); ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(d.x - 4, d.y - 2, 7 * s, 2.5 * s, 0, 3.4, 5.2); ctx.stroke(); break;
+      case 'lily': ctx.fillStyle = th.deep; ctx.beginPath(); ctx.arc(d.x, d.y, 7 * s, 0.4, TAU - 0.1); ctx.lineTo(d.x, d.y); ctx.fill(); break;
+      case 'reed': ctx.strokeStyle = th.deep; ctx.lineWidth = 2; ctx.lineCap = 'round'; for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(d.x + i * 4, d.y); ctx.lineTo(d.x + i * 6, d.y - 14 * s); ctx.stroke(); } ctx.fillStyle = '#B98A5A'; ctx.beginPath(); ctx.ellipse(d.x, d.y - 14 * s, 2, 4, 0, 0, TAU); ctx.fill(); break;
+      case 'leaf': { ctx.save(); ctx.translate(d.x, d.y); ctx.rotate(d.h * 1.3 + d.x); ctx.scale(0.7 * s, 0.7 * s); ctx.fillStyle = ['#E8833A', '#D9572E', '#F2B33D', '#C9702E'][d.h]; ctx.fill(LEAF); ctx.restore(); break; }
+      case 'mushroom': ctx.fillStyle = '#F4EBDD'; ctx.fillRect(d.x - 2 * s, d.y - 2, 4 * s, 6 * s); ctx.fillStyle = '#E26A5A'; ctx.beginPath(); ctx.ellipse(d.x, d.y - 3, 7 * s, 4.5 * s, 0, Math.PI, TAU); ctx.fill(); ctx.fillStyle = '#FFF4DC'; ctx.beginPath(); ctx.arc(d.x - 2, d.y - 5, 1.3, 0, TAU); ctx.arc(d.x + 3, d.y - 4, 1.1, 0, TAU); ctx.fill(); break;
+      case 'drift': ctx.fillStyle = '#DCE8F1'; ctx.beginPath(); ctx.ellipse(d.x + 2, d.y + 3, 20 * s, 8 * s, 0, 0, TAU); ctx.fill(); ctx.fillStyle = '#FFFFFF'; ctx.beginPath(); ctx.ellipse(d.x, d.y, 18 * s, 7 * s, 0, 0, TAU); ctx.fill(); break;
+      case 'twig': ctx.strokeStyle = '#9C7A5A'; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(d.x - 9 * s, d.y); ctx.lineTo(d.x + 9 * s, d.y - 3); ctx.moveTo(d.x + 2, d.y - 1.5); ctx.lineTo(d.x + 6, d.y - 7); ctx.stroke(); break;
+      case 'glow': { const k = rm ? 0.5 : 0.5 + 0.5 * Math.sin(t * 2 + d.x); ctx.fillStyle = `rgba(255,214,120,${0.25 + 0.3 * k})`; ctx.beginPath(); ctx.arc(d.x, d.y, 3 * s, 0, TAU); ctx.fill(); break; }
+    }
+  }
+  function drawAmbient(ctx, a, kind) {
+    ctx.save(); ctx.translate(a.x, a.y);
+    if (kind === 'snow') { ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.beginPath(); ctx.arc(0, 0, 2.5 * a.s, 0, TAU); ctx.fill(); ctx.strokeStyle = 'rgba(150,180,205,0.6)'; ctx.lineWidth = 1; ctx.stroke(); }
+    else if (kind === 'leaf') { ctx.rotate(a.r); ctx.scale(0.55 * a.s, 0.55 * a.s * Math.cos(a.r * 2)); ctx.fillStyle = a.h % 2 ? '#E8833A' : '#F2B33D'; ctx.fill(LEAF); }
+    else if (kind === 'petal') { ctx.rotate(a.r); ctx.fillStyle = 'rgba(255,170,205,0.85)'; ctx.beginPath(); ctx.ellipse(0, 0, 3.5 * a.s, 2 * a.s * Math.abs(Math.cos(a.r * 2)) + 0.6, 0, 0, TAU); ctx.fill(); }
+    else { const k = 0.5 + 0.5 * Math.sin(a.r * 3); ctx.fillStyle = `rgba(255,236,150,${0.35 + 0.55 * k})`; ctx.beginPath(); ctx.arc(0, 0, 2.2 * a.s, 0, TAU); ctx.fill(); }
+    ctx.restore();
+  }
+  Object.assign(LG.art, { drawScenery, drawAmbient });
+
+  // ---------- UI chips & glyphs ----------
+  function arrowHead(c, x, y, ang, s) {
+    c.beginPath(); c.moveTo(x + Math.cos(ang) * s, y + Math.sin(ang) * s);
+    c.lineTo(x + Math.cos(ang + 2.3) * s * 0.8, y + Math.sin(ang + 2.3) * s * 0.8);
+    c.lineTo(x + Math.cos(ang - 2.3) * s * 0.8, y + Math.sin(ang - 2.3) * s * 0.8); c.closePath(); c.fill(); c.stroke();
+  }
+  function speaker(c, s) {
+    c.beginPath(); c.moveTo(-s * 0.85, -s * 0.28); c.lineTo(-s * 0.5, -s * 0.28); c.lineTo(-s * 0.05, -s * 0.7);
+    c.lineTo(-s * 0.05, s * 0.7); c.lineTo(-s * 0.5, s * 0.28); c.lineTo(-s * 0.85, s * 0.28); c.closePath(); c.fill(); c.stroke();
+  }
+  const GLYPH = {
+    pause: (c, s) => { c.beginPath(); rr(c, -s * 0.55, -s * 0.7, s * 0.38, s * 1.4, s * 0.15); c.fill(); c.beginPath(); rr(c, s * 0.17, -s * 0.7, s * 0.38, s * 1.4, s * 0.15); c.fill(); },
+    play: (c, s) => { c.beginPath(); c.moveTo(-s * 0.4, -s * 0.72); c.lineTo(s * 0.75, 0); c.lineTo(-s * 0.4, s * 0.72); c.closePath(); c.fill(); c.stroke(); },
+    restart: (c, s) => { const r = s * 0.68, a0 = -0.35 * Math.PI, a1 = 1.25 * Math.PI; c.beginPath(); c.arc(0, 0, r, a0, a1); c.stroke(); arrowHead(c, Math.cos(a0) * r, Math.sin(a0) * r, a0 - Math.PI / 2, s * 0.42); },
+    soundOn: (c, s) => { speaker(c, s); c.beginPath(); c.arc(-s * 0.05, 0, s * 0.45, -0.8, 0.8); c.stroke(); c.beginPath(); c.arc(-s * 0.05, 0, s * 0.8, -0.8, 0.8); c.stroke(); },
+    soundOff: (c, s) => { speaker(c, s); c.beginPath(); c.moveTo(s * 0.25, -s * 0.3); c.lineTo(s * 0.85, s * 0.3); c.moveTo(s * 0.85, -s * 0.3); c.lineTo(s * 0.25, s * 0.3); c.stroke(); },
+    levels: (c, s) => { for (const [x, y] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) { c.beginPath(); rr(c, x * s * 0.42 - s * 0.32, y * s * 0.42 - s * 0.32, s * 0.64, s * 0.64, s * 0.14); c.fill(); } },
+    next: (c, s) => { GLYPH.play(c, s * 0.9); c.beginPath(); c.moveTo(s * 0.85, -s * 0.65); c.lineTo(s * 0.85, s * 0.65); c.stroke(); },
+    left: (c, s) => { c.beginPath(); c.moveTo(s * 0.35, -s * 0.7); c.lineTo(-s * 0.4, 0); c.lineTo(s * 0.35, s * 0.7); c.stroke(); },
+    lock: (c, s) => drawLockGlyph(c, s),
+    // effects on: a little burst; effects off: the same burst crossed out
+    motionOn: (c, s) => { for (let i = 0; i < 8; i++) { const a = (i * TAU) / 8; c.beginPath(); c.moveTo(Math.cos(a) * s * 0.35, Math.sin(a) * s * 0.35); c.lineTo(Math.cos(a) * s * (i % 2 ? 0.6 : 0.85), Math.sin(a) * s * (i % 2 ? 0.6 : 0.85)); c.stroke(); } c.beginPath(); c.arc(0, 0, s * 0.16, 0, TAU); c.fill(); },
+    motionOff: (c, s) => { c.save(); c.globalAlpha *= 0.45; GLYPH.motionOn(c, s); c.restore(); c.beginPath(); c.moveTo(-s * 0.8, s * 0.8); c.lineTo(s * 0.8, -s * 0.8); c.stroke(); },
+  };
+  function chip(ctx, x, y, r, glyph, o = {}) {
+    ctx.save(); ctx.translate(x, y + (o.pressed ? 3 : 0)); ctx.globalAlpha = o.alpha == null ? 1 : o.alpha;
+    const R = r * (o.pressed ? 0.94 : 1) * (o.pulse || 1);
+    ctx.fillStyle = 'rgba(42,35,64,0.25)'; ctx.beginPath(); ctx.arc(0, o.pressed ? 1 : 4, R, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU); ctx.fillStyle = o.primary ? C.gold : C.cream; ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+    ctx.fillStyle = C.ink; ctx.strokeStyle = C.ink; ctx.lineWidth = R * 0.16; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    if (GLYPH[glyph]) GLYPH[glyph](ctx, R * 0.5);
+    ctx.restore();
+  }
+  function drawHand(ctx, x, y, s, a = 1) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.globalAlpha = a; ctx.rotate(-0.35);
+    const p = new Path2D();
+    p.moveTo(-6, 26); p.lineTo(-10, 8); p.quadraticCurveTo(-12, 0, -6, 2); p.lineTo(-4, 6); p.lineTo(-4, -18);
+    p.quadraticCurveTo(0, -24, 4, -18); p.lineTo(4, -2); p.quadraticCurveTo(8, -6, 11, -1); p.quadraticCurveTo(15, -4, 17, 2);
+    p.lineTo(17, 16); p.quadraticCurveTo(14, 26, 8, 28); p.closePath();
+    ctx.fillStyle = C.cream; ctx.fill(p); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.lineJoin = 'round'; ctx.stroke(p);
+    ctx.restore();
+  }
+  Object.assign(LG.art, { chip, GLYPH, drawHand });
+})(typeof window !== 'undefined' ? window : globalThis);
+
+;
+// Loop Garden — presentation, input, audio, screens.
+(function () {
+  'use strict';
+  const LG = window.LG, A = LG.art, C = LG.COL, TAU = Math.PI * 2, DT = LG.CONST.DT;
+  const { clamp, easeOutBack } = LG.ease;
+  const cv = document.getElementById('game'), ctx = cv.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // ---------- save ----------
+  const KEY = 'loopgarden.v2';
+  function load() {
+    try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.v === 2) return s; } catch (e) { /* storage blocked */ }
+    return { v: 2, unlocked: 1, stars: [], best: [], par: [], arenaBest: 0, hat: 0, muted: false, rm: null };
+  }
+  let save = load();
+  window.LG_SAVE_KEY = KEY;
+  function persist() {
+    const j = JSON.stringify(save);
+    try { localStorage.setItem(KEY, j); } catch (e) { /* ignore */ }
+    if (LG.platform && LG.platform.saveData) LG.platform.saveData(KEY, j);
+  }
+  // merge a cloud copy: keep the best of each record, never lose local progress
+  function mergeSave(json) {
+    let r; try { r = JSON.parse(json); } catch (e) { return; }
+    if (!r || r.v !== save.v) return;
+    save.unlocked = Math.max(save.unlocked || 1, r.unlocked || 1);
+    save.arenaBest = Math.max(save.arenaBest || 0, r.arenaBest || 0);
+    const n = Math.max((save.stars || []).length, (r.stars || []).length);
+    for (let i = 0; i < n; i++) {
+      save.stars[i] = Math.max(save.stars[i] || 0, (r.stars || [])[i] || 0) || save.stars[i];
+      if ((r.par || [])[i]) { save.par = save.par || []; save.par[i] = true; }
+      const a = save.best[i], b = (r.best || [])[i]; if (b && (!a || b < a)) save.best[i] = b;
+    }
+    persist();
+  }
+  const rmq = window.matchMedia ? matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
+  const RM = () => (save.rm == null ? rmq.matches : save.rm);
+
+  // ---------- audio (synthesised) ----------
+  const AU = { ctx: null, master: null, music: null, next: 0, step: 0 };
+  // ---------- portal ads: pause play and sound while a break runs ----------
+  const PF = LG.platform || { adActive: false, showAd: () => Promise.resolve('unsupported'), bind() {} };
+  let portalMuted = false; // the portal's own mute setting (CrazyGames)
+  const gainOn = () => (save.muted || portalMuted ? 0 : 0.8);
+  PF.bind(() => { if (AU.master) AU.master.gain.value = 0; joy.on = false; keys.clear(); },
+          () => { if (AU.master) AU.master.gain.value = gainOn(); last = performance.now() / 1000; },
+          (m) => { portalMuted = m; if (AU.master && !PF.adActive) AU.master.gain.value = gainOn(); },
+          (json) => mergeSave(json));
+  let prerollAsked = false;
+  function firstGesture() { if (!prerollAsked) { prerollAsked = true; PF.showAd('preroll'); } }
+  // a break at a natural pause; the next step runs once the break settles
+  function breakThen(fn) { PF.showAd('break').then(fn); }
+  function audioInit() {
+    firstGesture();
+    if (AU.ctx) { if (AU.ctx.state !== 'running' && !document.hidden) AU.ctx.resume().catch(() => {}); return; }
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    try {
+      AU.ctx = new AC(); AU.master = AU.ctx.createGain(); AU.master.gain.value = gainOn(); AU.master.connect(AU.ctx.destination);
+      AU.music = AU.ctx.createGain(); AU.music.gain.value = 0.16; AU.music.connect(AU.master);
+      AU.next = AU.ctx.currentTime + 0.1;
+    } catch (e) { AU.ctx = null; }
+  }
+  function tone(f, d, o = {}) {
+    const a = AU.ctx; if (!a || save.muted || a.state !== 'running') return;
+    const t0 = a.currentTime + (o.at || 0), osc = a.createOscillator(), g = a.createGain();
+    osc.type = o.type || 'sine'; osc.frequency.setValueAtTime(f, t0);
+    if (o.to) osc.frequency.exponentialRampToValueAtTime(o.to, t0 + d);
+    const v = o.vol == null ? 0.25 : o.vol;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(v, t0 + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
+    osc.connect(g); g.connect(o.bus || AU.master); osc.start(t0); osc.stop(t0 + d + 0.05);
+  }
+  function noise(d, o = {}) {
+    const a = AU.ctx; if (!a || save.muted || a.state !== 'running') return;
+    const n = Math.floor(a.sampleRate * d), b = a.createBuffer(1, n, a.sampleRate), ch = b.getChannelData(0);
+    for (let i = 0; i < n; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+    s.buffer = b; f.type = o.type || 'bandpass'; f.frequency.value = o.f || 2000; g.gain.value = o.vol || 0.2;
+    s.connect(f); f.connect(g); g.connect(AU.master); s.start(a.currentTime + (o.at || 0));
+  }
+  const NOTE = (n) => 440 * Math.pow(2, (n - 69) / 12);
+  const SFX = {
+    loop: (k) => {
+      if (!k) { [72, 76].forEach((n, i) => tone(NOTE(n - 12), 0.2, { at: i * 0.06, type: 'triangle', vol: 0.08 })); return; }
+      [72, 76, 79, 84, 88].forEach((n, i) => tone(NOTE(n), 0.3, { at: i * 0.045, type: 'triangle', vol: 0.2 }));
+      [60, 64, 67].forEach((n) => tone(NOTE(n), 0.7, { at: 0.2, type: 'sine', vol: 0.12 }));
+      noise(0.35, { f: 9000, vol: 0.06, at: 0.05 });
+    },
+    combo: (n) => { for (let i = 0; i < n + 2; i++) tone(NOTE(84 + [0, 4, 7, 12, 16, 19, 24, 28][i % 8]), 0.25, { at: 0.25 + i * 0.07, type: 'square', vol: 0.07 }); },
+    warn: () => noise(0.25, { f: 400, vol: 0.12, type: 'lowpass' }),
+    heal: () => [76, 83, 88].forEach((n, i) => tone(NOTE(n), 0.2, { at: i * 0.06, vol: 0.15 })),
+    over: () => [72, 67, 64, 60].forEach((n, i) => tone(NOTE(n), 0.4, { at: i * 0.16, type: 'triangle', vol: 0.2 })),
+    par: () => [79, 84, 91].forEach((n, i) => tone(NOTE(n), 0.4, { at: 0.9 + i * 0.09, type: 'sine', vol: 0.16 })),
+    pop: () => { tone(320, 0.12, { to: 900, type: 'square', vol: 0.12 }); noise(0.12, { f: 3000, vol: 0.15 }); },
+    bloom: () => [67, 71, 74, 79, 83].forEach((n, i) => tone(NOTE(n), 0.3, { at: i * 0.07, type: 'sine', vol: 0.18 })),
+    hurt: () => { tone(330, 0.3, { to: 110, type: 'triangle', vol: 0.3 }); noise(0.18, { f: 600, vol: 0.12 }); },
+    spawn: () => tone(500, 0.15, { to: 900, type: 'sine', vol: 0.15 }),
+    snip: () => { noise(0.05, { f: 6000, vol: 0.25 }); noise(0.05, { f: 7000, vol: 0.25, at: 0.08 }); },
+    pick: () => { tone(NOTE(76), 0.1, { type: 'square', vol: 0.08 }); tone(NOTE(83), 0.16, { at: 0.08, type: 'square', vol: 0.08 }); },
+    give: () => [72, 76, 79, 84, 88].forEach((n, i) => tone(NOTE(n), 0.25, { at: i * 0.08, type: 'triangle', vol: 0.18 })),
+    unlock: () => { noise(0.06, { f: 1500, vol: 0.2 }); tone(NOTE(79), 0.3, { at: 0.06, type: 'triangle', vol: 0.18 }); },
+    gate: () => [60, 64, 67, 72].forEach((n, i) => tone(NOTE(n), 0.4, { at: i * 0.1, type: 'triangle', vol: 0.2 })),
+    win: () => [72, 76, 79, 84, 79, 84, 88].forEach((n, i) => tone(NOTE(n), 0.3, { at: i * 0.11, type: 'triangle', vol: 0.22 })),
+    sparkle: () => { tone(NOTE(96), 0.12, { vol: 0.12 }); tone(NOTE(100), 0.2, { at: 0.06, vol: 0.12 }); },
+    lantern: () => tone(NOTE(79), 0.5, { to: NOTE(84), vol: 0.15 }),
+    wind: () => { for (let i = 0; i < 4; i++) noise(0.05, { f: 900, vol: 0.15, at: i * 0.12 }); },
+    dash: () => noise(0.3, { f: 700, vol: 0.2, type: 'lowpass' }),
+    bonk: () => tone(160, 0.25, { to: 60, type: 'sine', vol: 0.4 }),
+    follow: () => { tone(NOTE(88), 0.08, { vol: 0.12 }); tone(NOTE(91), 0.08, { at: 0.1, vol: 0.12 }); },
+    scared: () => tone(NOTE(93), 0.2, { to: NOTE(81), vol: 0.14 }),
+    ask: () => { tone(NOTE(74), 0.12, { type: 'triangle', vol: 0.1 }); tone(NOTE(79), 0.16, { at: 0.13, type: 'triangle', vol: 0.1 }); },
+    tap: () => tone(NOTE(84), 0.06, { type: 'triangle', vol: 0.1 }),
+    step: () => noise(0.03, { f: 1200, vol: 0.035 }),
+  };
+  // a small song per world: melody, bass, soft chord pad and light percussion
+  const SONGS = [
+    { bpm: 112, key: 60, mel: [12, 16, 19, 16, 21, 19, 16, 14, 12, 14, 16, 19, 16, 14, 12, -1], prog: [0, 0, 7, 7, 5, 5, 7, 7], lead: 'sine' },
+    { bpm: 118, key: 62, mel: [14, 12, 9, 12, 14, 16, 14, -1, 9, 12, 14, 16, 19, 16, 14, 12], prog: [0, 5, 7, 0, 0, 5, 7, 7], lead: 'triangle' },
+    { bpm: 104, key: 57, mel: [12, -1, 15, 17, 19, -1, 17, 15, 12, -1, 10, 12, 15, -1, 12, -1], prog: [0, 0, 3, 3, 5, 5, 7, 7], lead: 'sine' },
+    { bpm: 122, key: 59, mel: [12, 14, 16, 19, 21, 19, 16, 14, 16, 14, 12, 9, 12, -1, 12, -1], prog: [0, 9, 5, 7, 0, 9, 5, 7], lead: 'triangle' },
+    { bpm: 100, key: 64, mel: [19, -1, 16, 14, 12, -1, 14, 16, 19, 21, 19, 16, 14, -1, 12, -1], prog: [0, 0, 5, 5, 9, 9, 7, 7], lead: 'sine' },
+    { bpm: 128, key: 61, mel: [12, 16, 19, 23, 21, 19, 16, 19, 12, 16, 19, 24, 23, 19, 16, 14], prog: [0, 5, 9, 7, 0, 5, 7, 7], lead: 'triangle' },
+  ];
+  let song = SONGS[0], songBoost = 0;
+  function musicTick() {
+    const a = AU.ctx; if (!a || a.state !== 'running' || save.muted || mode === 'pause') { if (a) AU.next = a.currentTime + 0.1; return; }
+    while (AU.next < a.currentTime + 0.25) {
+      const i = AU.step++, t = AU.next - a.currentTime, beat = 30 / (song.bpm + songBoost);
+      const bar = Math.floor(i / 8), root = song.key + song.prog[bar % song.prog.length];
+      const m = song.mel[(i >> 1) % song.mel.length];
+      if (m >= 0 && i % 2 === 0) tone(NOTE(song.key + m), 0.42, { at: t, type: song.lead, vol: 0.42, bus: AU.music });
+      if (i % 4 === 0) tone(NOTE(root - 12), 0.5, { at: t, type: 'triangle', vol: 0.5, bus: AU.music });
+      if (i % 8 === 0) [0, 4, 7].forEach((d) => tone(NOTE(root + d), beat * 7, { at: t, type: 'sine', vol: 0.09, bus: AU.music }));
+      if (i % 4 === 2) noise(0.03, { f: 8000, vol: 0.025 + songBoost * 0.0006, at: t });
+      if (i % 8 === 0 || (songBoost > 10 && i % 8 === 4)) tone(90, 0.12, { at: t, to: 45, type: 'sine', vol: 0.18, bus: AU.music });
+      AU.next += beat;
+    }
+  }
+  function setMuted(m) { save.muted = m; persist(); if (AU.master) AU.master.gain.value = gainOn(); }
+
+  // ---------- app state ----------
+  let mode = 'map';
+  let S = null, hv = null, fx = null, cam = { x: 0, y: 0, z: 1 };
+  let winT = 0, hitStop = 0, shake = 0, hadInput = false, lastLevel = 0;
+  const keys = new Set();
+  const joy = { on: false, id: null, bx: 0, by: 0, x: 0, y: 0 };
+  let buttons = [], pressed = null, mapTiles = [], mapFocus = -1;
+  const touchy = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+
+  const ROOM_HEARTS = 3;
+  const HAT_COST = [0, 8, 18, 30, 42, 54]; // total stars needed for each hat (54 = every star)
+  const totalStars = () => save.stars.reduce((a, b) => a + (b || 0), 0);
+  const ARENA_THEME = 5, ARENA_AFTER = 6; // the arena opens once room 6 is cleared
+  const themeOf = (st) => LG.THEMES[st.li < 0 ? ARENA_THEME : (LG.LEVELS[st.li].theme || 0) % LG.THEMES.length];
+  function startArena() {
+    if (!LG.makeArena) return;
+    startLevel(-1);
+  }
+  function startLevel(i) {
+    lastLevel = i; S = i < 0 ? LG.makeArena((Date.now() & 0xffff) + 1) : LG.makeState(i); mode = 'play'; winT = 0; hadInput = i !== 0;
+    song = SONGS[themeOf(S).music % SONGS.length]; songBoost = 0; AU.step = 0;
+    hv = { phase: 0, squash: 1, sq: { v: 1, vel: 0 }, spr: { v: 0, vel: 0 }, dir: 1, blinkAt: 2, blinkUntil: 0, t: 0, st: 0, state: 'idle', stepAcc: 0 };
+    fx = { parts: [], rings: [], loops: [], flowers: [], snips: [], hop: new Map(), budAnim: 0 };
+    // seeded meadow decor (scenery: pale, no outline)
+    const r = mulberry(99 + i * 13), dec = [];
+    const th = themeOf(S);
+    for (let k = 0; k < (S.W * S.H) / 8000; k++) dec.push({ x: r() * S.W, y: r() * S.H, k: th.decor[Math.floor(r() * th.decor.length)], h: Math.floor(r() * 4), s: 0.6 + r() * 0.6 });
+    fx.decor = dec;
+    fx.amb = []; for (let k = 0; k < 26; k++) fx.amb.push({ x: r() * S.W, y: r() * S.H, s: 0.7 + r() * 0.7, r: r() * TAU, h: k, v: 0.6 + r() * 0.8 });
+    fx.slow = 0; fx.flash = 0; fx.waves = []; fx.combos = []; fx.over = 0;
+    const p = S.player; cam.z = zoom(); fx.intro = RM() || i < 0 ? 0 : 1.1; cam.x = p.x; cam.y = p.y; for (let k = 0; k < 60; k++) updateCam(0.1); fx.introDone = false;
+    joy.on = false;
+  }
+  function mulberry(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+  // ---------- events -> juice ----------
+  function burst(x, y, n, col, sp = 160, life = 0.5, size = 5, grav = 0) {
+    if (RM()) n = Math.min(n, 3);
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * TAU, v = sp * (0.4 + Math.random() * 0.6);
+      fx.parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - (grav ? 120 : 0), life, t: 0, size: size * (0.6 + Math.random() * 0.6), col, grav, kind: 'dot' });
+    }
+    if (fx.parts.length > 220) fx.parts.splice(0, fx.parts.length - 220);
+  }
+  function hearts(x, y) { for (let i = 0; i < 3; i++) fx.parts.push({ x: x + (i - 1) * 14, y, vx: 0, vy: -45, life: 1.1, t: -i * 0.15, size: 1, kind: 'heart', ph: i }); }
+  function handle(ev) {
+    for (const e of ev) {
+      const sf = SFX[e.t];
+      switch (e.t) {
+        case 'loop':
+          fx.loops.push({ poly: e.poly, t: 0, caught: e.caught });
+          SFX.loop(e.caught > 0);
+          if (e.caught > 0) {
+            // the moment of capture: brief slow-motion, a soft flash, a shockwave and petals along the ribbon
+            if (!RM()) { fx.slow = 0.22; fx.flash = 0.35; }
+            fx.waves.push({ x: e.x, y: e.y, t: 0, r: Math.sqrt(LG.geo.polyArea(e.poly) / Math.PI) });
+            for (let k = 0; k < e.poly.length; k += 3) fx.parts.push({ x: e.poly[k].x, y: e.poly[k].y, vx: (Math.random() - 0.5) * 40, vy: -30 - Math.random() * 40, life: 0.9, t: -k * 0.004, size: 4, col: [C.bloom, C.gold, '#FFFFFF'][k % 3], kind: 'dot' });
+          }
+          break;
+        case 'combo':
+          SFX.combo(e.n); fx.combos.push({ x: e.x, y: e.y, n: e.n, t: 0 }); shake = RM() ? 0 : 7;
+          if (S.li < 0) songBoost = Math.min(30, songBoost + 2);
+          break;
+        case 'warn': SFX.warn(); break;
+        case 'spawned': burst(e.x, e.y, 10, '#8C7F99', 160, 0.45, 6); break;
+        case 'hp': SFX.hurt(); shake = RM() ? 0 : 10; hitStop = RM() ? 0 : 0.1; burst(S.player.x, S.player.y - 10, 16, '#B8B2C4', 220, 0.55, 9); fx.hpFlash = 0.5; break;
+        case 'heal': SFX.heal(); hearts(S.player.x, S.player.y - 40); break;
+        case 'over': SFX.over(); finishArena(e.score); break;
+        case 'fade': break;
+        case 'boost': SFX.give(); fx.rings.push({ x: e.x, y: e.y, t: 0, col: C.gold }); burst(e.x, e.y, 18, C.gold, 220, 0.6, 5); break;
+        case 'boostEnd': SFX.loop(false); break;
+        case 'shrink': SFX.pop(); SFX.wind(); burst(e.x, e.y, 18, C.danger, 240, 0.5, 7); fx.waves.push({ x: e.x, y: e.y, t: 0, r: 60 }); shake = RM() ? 0 : 6; break;
+        case 'pop':
+          SFX.pop(); hitStop = RM() ? 0 : 0.06; shake = RM() ? 0 : 5;
+          burst(e.x, e.y, 14, C.danger, 220, 0.45, 6);
+          burst(e.x, e.y, 10, C.bloom, 160, 0.8, 5);
+          for (let k = 0; k < 7; k++) { const a = (k / 7) * TAU + Math.random(); const d = k ? 14 + Math.random() * 22 : 0; fx.flowers.push({ x: e.x + Math.cos(a) * d, y: e.y + Math.sin(a) * d * 0.8, h: Math.floor(Math.random() * 4), t: -k * 0.05, s: k ? 0.9 : 1.3 }); }
+          break;
+        case 'bloom': sf(); burst(e.x, e.y, 14, C.bloom, 180, 0.8, 5); fx.rings.push({ x: e.x, y: e.y, t: 0, col: C.teal }); break;
+        case 'free': SFX.bloom(); burst(e.x, e.y, 12, C.plank, 200, 0.6, 5); hearts(e.x, e.y - 30); break;
+        case 'hurt': if (S.li >= 0 && S.hurts >= ROOM_HEARTS && !(fx.restartT > 0)) { fx.restartT = 1.6; { const lt = S.lanterns.find((l) => l.lit && !l.spent); fx.keep = !!lt; if (lt) lt.spent = true; } SFX.over(); } sf(); shake = RM() ? 0 : 9; hitStop = RM() ? 0 : 0.08; burst(e.x, e.y - 10, 16, '#B8B2C4', 220, 0.55, 9); fx.rings.push({ x: e.x, y: e.y, t: 0, col: '#B8B2C4' }); hv.state = 'hurt'; break;
+        case 'spawn': sf(); fx.rings.push({ x: e.x, y: e.y, t: 0, col: C.bloom }); break;
+        case 'snip': sf(); fx.snips.push({ x: e.x, y: e.y, t: 0 }); burst(e.x, e.y, 16, C.gold, 220, 0.6, 5); shake = RM() ? 0 : 3; break;
+        case 'pick': sf(); fx.rings.push({ x: e.x, y: e.y, t: 0, col: C.teal }); break;
+        case 'give': sf(); hearts(e.x, e.y - 50); fx.hop.set(e.x + ',' + e.y, 0); break;
+        case 'unlock': sf(); burst(e.x, e.y, 12, C.teal, 180, 0.6, 5); break;
+        case 'gate': sf(); burst(e.x, e.y, 18, C.gold, 220, 0.8, 5); fx.gateT = 0; break;
+        case 'win': sf(); break;
+        case 'sparkle': sf(); fx.rings.push({ x: e.x, y: e.y, t: 0, col: C.gold }); burst(e.x, e.y, 8, C.gold, 140, 0.5, 4); break;
+        case 'lantern': sf(); fx.rings.push({ x: e.x, y: e.y - 48, t: 0, col: C.bloom }); break;
+        case 'wind': case 'dash': case 'follow': case 'scared': case 'ask': sf(); break;
+        case 'bonk': sf(); shake = RM() ? 0 : (e.hard ? 4 : 0); burst(e.x, e.y, 6, C.cream, 120, 0.4, 5); break;
+      }
+    }
+  }
+
+  // ---------- input ----------
+  function inputVec() {
+    let mx = 0, my = 0;
+    if (keys.has('ArrowLeft') || keys.has('KeyA')) mx -= 1;
+    if (keys.has('ArrowRight') || keys.has('KeyD')) mx += 1;
+    if (keys.has('ArrowUp') || keys.has('KeyW')) my -= 1;
+    if (keys.has('ArrowDown') || keys.has('KeyS')) my += 1;
+    if (joy.on) {
+      const dx = joy.x - joy.bx, dy = joy.y - joy.by, L = Math.hypot(dx, dy);
+      const dead = 6, full = 46;
+      if (L > dead) { const k = clamp((L - dead) / (full - dead), 0, 1); mx = (dx / L) * k; my = (dy / L) * k; }
+    }
+    return { mx, my };
+  }
+  function hitButton(x, y) { for (let i = buttons.length - 1; i >= 0; i--) { const b = buttons[i]; if (Math.hypot(x - b.x, y - b.y) <= b.r + 6) return b; } return null; }
+  cv.addEventListener('pointerdown', (e) => {
+    audioInit();
+    const x = e.clientX, y = e.clientY;
+    const b = hitButton(x, y);
+    if (b) { pressed = { b, id: e.pointerId }; cv.setPointerCapture && cv.setPointerCapture(e.pointerId); return; }
+    if (mode === 'pause') { setMode('play'); return; }
+    if (mode === 'win' && winT > 0.6 && winT < 2.1) { winT = 2.15; return; }
+    if (mode === 'play' && !joy.on) {
+      joy.on = true; joy.id = e.pointerId; joy.bx = joy.x = x; joy.by = joy.y = y; hadInput = true;
+      try { cv.setPointerCapture(e.pointerId); } catch (er) { /* ignore */ }
+    }
+    e.preventDefault();
+  });
+  cv.addEventListener('pointermove', (e) => {
+    if (joy.on && e.pointerId === joy.id) {
+      joy.x = e.clientX; joy.y = e.clientY;
+      // drag the base along so direction changes stay responsive
+      const dx = joy.x - joy.bx, dy = joy.y - joy.by, L = Math.hypot(dx, dy), max = 60;
+      if (L > max) { joy.bx = joy.x - (dx / L) * max; joy.by = joy.y - (dy / L) * max; }
+    }
+  });
+  function endPointer(e) {
+    if (joy.on && e.pointerId === joy.id) joy.on = false;
+    if (pressed && pressed.id === e.pointerId) {
+      const b = hitButton(e.clientX, e.clientY);
+      // buttons are rebuilt every frame, so match the released button by position, not by object
+      if (e.type === 'pointerup' && b && Math.hypot(b.x - pressed.b.x, b.y - pressed.b.y) < 2) { SFX.tap(); b.act(); }
+      pressed = null;
+    }
+  }
+  cv.addEventListener('pointerup', endPointer);
+  cv.addEventListener('pointercancel', endPointer);
+  cv.addEventListener('lostpointercapture', (e) => { if (joy.on && e.pointerId === joy.id) joy.on = false; });
+  window.addEventListener('keydown', (e) => {
+    audioInit();
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
+    if (e.repeat) return;
+    keys.add(e.code); if (/Arrow|Key[WASD]/.test(e.code)) hadInput = true;
+    if (mode === 'map' && mapTiles.length) {
+      const d = { ArrowRight: 1, KeyD: 1, ArrowLeft: -1, KeyA: -1 }[e.code];
+      if (d) { const cur = mapTiles[mapFocus], cand = mapTiles.map((q, i) => ({ q, i })).filter(({ q }) => Math.abs(q.y - cur.y) < 10 && (q.x - cur.x) * d > 10); if (cand.length) { cand.sort((a, b) => Math.abs(a.q.x - cur.x) - Math.abs(b.q.x - cur.x)); mapFocus = cand[0].i; SFX.tap(); } return; }
+      const v = { ArrowDown: 1, KeyS: 1, ArrowUp: -1, KeyW: -1 }[e.code];
+      if (v) { const cur = mapTiles[mapFocus], cand = mapTiles.map((q, i) => ({ q, i })).filter(({ q }) => (q.y - cur.y) * v > 10); if (cand.length) { cand.sort((a, b) => Math.abs(a.q.y - cur.y) - Math.abs(b.q.y - cur.y) || Math.abs(a.q.x - cur.x) - Math.abs(b.q.x - cur.x)); mapFocus = cand[0].i; SFX.tap(); } return; }
+      if ((e.code === 'Enter' || e.code === 'Space') && mapFocus >= 0 && mapTiles[mapFocus]) { mapTiles[mapFocus].act(); return; }
+    }
+    if (e.code === 'Escape' || e.code === 'KeyP') { if (mode === 'play') setMode('pause'); else if (mode === 'pause') setMode('play'); else if (mode === 'map' && S && S.li >= 0 && !S.won) setMode('play'); }
+    if (e.code === 'Enter' || e.code === 'Space') {
+      if (mode === 'win') { if (winT > (RM() ? 1.3 : 2.1)) nextLevel(); else if (winT > 0.6) winT = 2.15; } else if (mode === 'over') { if (winT > 1.2) startArena(); } else if (mode === 'pause') setMode('play'); else if (mode === 'map') startLevel(Math.min(save.unlocked, LG.LEVELS.length) - 1);
+    }
+    if (e.code === 'KeyR' && (mode === 'play' || mode === 'pause')) startLevel(lastLevel);
+    if (e.code === 'KeyM') setMuted(!save.muted);
+  });
+  window.addEventListener('keyup', (e) => keys.delete(e.code));
+  const QA = /[?&]qa=1/.test(location.search);
+  window.addEventListener('blur', () => { keys.clear(); joy.on = false; if (mode === 'play' && !QA) setMode('pause'); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { keys.clear(); joy.on = false; if (mode === 'play' && !QA) setMode('pause'); if (AU.ctx) AU.ctx.suspend().catch(() => {}); }
+    else if (AU.ctx) AU.ctx.resume().catch(() => {});
+  });
+  function setMode(m) { mode = m; joy.on = false; keys.clear(); }
+  function nextLevel() { if (lastLevel + 1 < LG.LEVELS.length) { const n = lastLevel + 1; breakThen(() => startLevel(n)); } else setMode('map'); }
+
+  // ---------- layout ----------
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  }
+  window.addEventListener('resize', resize); resize();
+  const COVER = /[?&]cover=1/.test(location.search); // marketing captures: real gameplay, no HUD
+  const zoom = () => {
+    let z = clamp(Math.min(W, H) / 560, 0.55, 1.3);
+    // landscape/desktop: show most of the room's height so the goal stays in view
+    if (S && W > H && S.li >= 0 && H >= 600 && !COVER) z = Math.max(z * 0.55, Math.min(z, H / (S.H + 110)));
+    if (W > H && H < 600) z = clamp(H / 600, 0.6, 1); // short landscape phones: keep the hero big, camera scrolls
+    return z;
+  };
+  const safeEl = document.getElementById('safe');
+  const safe = () => {
+    const cs = safeEl ? getComputedStyle(safeEl) : null, v = (k) => (cs ? parseFloat(cs[k]) || 0 : 0);
+    return { t: 10 + v('paddingTop'), l: 10 + v('paddingLeft'), r: 10 + v('paddingRight'), b: 10 + v('paddingBottom') };
+  };
+
+  // ---------- update ----------
+  let acc = 0, last = performance.now() / 1000, rt = 0;
+  function frame() {
+    const now = performance.now() / 1000;
+    let dt = Math.min(0.05, now - last); last = now; rt += dt;
+    // tell the portal when real play is happening (not menus, pauses, results or ads)
+    const isPlaying = mode === 'play' && !PF.adActive && !document.hidden;
+    if (isPlaying) PF.gameplayStart(); else PF.gameplayStop();
+    if (PF.adActive) { draw(); requestAnimationFrame(frame); return; }
+    musicTick();
+    simulate(dt, null);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  // one frame of simulation; inp overrides live input (QA hook)
+  function simulate(dt, inp) {
+    if (mode !== 'play' && mode !== 'win' && mode !== 'over') return;
+    if (hitStop > 0) { hitStop -= dt; dt = 0; }
+    if (fx.slow > 0) { fx.slow -= dt; dt *= 0.3; }
+    if (mode !== 'over') {
+      acc += dt;
+      while (acc >= DT) {
+        acc -= DT;
+        const ev = [];
+        LG.step(S, mode === 'play' ? inp || inputVec() : { mx: 0, my: 0 }, DT, ev);
+        if (ev.length) handle(ev);
+        animHero(DT);
+        if (mode === 'over') break;
+      }
+    }
+    if (S.won && mode === 'play') { mode = 'win'; winT = 0; finishLevel(); }
+    if (fx.restartT > 0 && mode === 'play') { S.player.vx = S.player.vy = 0; fx.restartT -= dt; if (fx.restartT <= 0) { if (fx.keep) { fx.restartT = 0; S.hurts = 0; fx.keep = false; SFX.heal(); hearts(S.player.x, S.player.y - 40); } else { const keep = lastLevel; startLevel(keep); fx.intro = 0; return; } } }
+    if (mode === 'win' || mode === 'over') winT += dt;
+    if (S.li < 0 && S.arena && mode === 'play') songBoost = Math.max(songBoost, Math.min(30, S.arena.wave * 3));
+    updateFx(dt);
+    updateCam(dt);
+  }
+  function finishArena(score) {
+    mode = 'over'; winT = 0; joy.on = false;
+    fx.newBest = score > (save.arenaBest || 0);
+    save.arenaBest = Math.max(save.arenaBest || 0, score); persist();
+  }
+  function finishLevel() {
+    const st = LG.stars(S), i = lastLevel, before = totalStars();
+    fx.parWon = !!(LG.parMet && LG.parMet(S));
+    if (fx.parWon) { save.par = save.par || []; save.par[i] = true; SFX.par(); }
+    save.stars[i] = Math.max(save.stars[i] || 0, st);
+    save.best[i] = Math.min(save.best[i] || 1e9, Math.round(LG.clock ? LG.clock(S) : S.t));
+    save.unlocked = Math.max(save.unlocked, Math.min(LG.LEVELS.length, i + 2));
+    const after = totalStars(); fx.newHat = HAT_COST.findIndex((c, k) => k > 0 && before < c && after >= c);
+    if (fx.newHat > 0) save.hat = fx.newHat;
+    persist();
+  }
+  function spring(s, target, k, d, dt) { const a = -k * (s.v - target) - d * s.vel; s.vel += a * dt; s.v += s.vel * dt; }
+  function animHero(dt) {
+    const p = S.player;
+    hv.t += dt; hv.st += dt;
+    const ns = S.won ? 'celebrate' : p.dead ? 'hurt' : p.carry ? 'carry' : p.moving > 20 ? 'run' : 'idle';
+    if (ns !== hv.state) { if (ns === 'run' && hv.state === 'idle') hv.sq.v = 0.9; hv.state = ns; hv.st = 0; }
+    if (Math.abs(p.vx) > 8) hv.dir = p.vx > 0 ? 1 : -1;
+    hv.phase += (p.moving * dt) / 30 * TAU * 0.5;
+    hv.stepAcc += p.moving * dt;
+    if (hv.stepAcc > 60 && !p.dead) { hv.stepAcc = 0; SFX.step(); if (!RM() && Math.random() < 0.6) fx.parts.push({ x: p.x - hv.dir * 8, y: p.y + 12, vx: -p.vx * 0.1, vy: -10, life: 0.3, t: 0, size: 4, col: C.cream, kind: 'dot' }); }
+    spring(hv.sq, 1, 900, 30, dt);
+    spring(hv.spr, clamp(-p.vx * 0.0018 - p.vy * 0.0008, -0.7, 0.7), 140, 6, dt);
+    if (hv.t > hv.blinkAt) { hv.blinkUntil = hv.t + 0.12; hv.blinkAt = hv.t + 2.5 + Math.random() * 2; }
+  }
+  function updateFx(dt) {
+    for (const q of fx.parts) { q.t += dt; if (q.t < 0) continue; q.x += q.vx * dt; q.y += q.vy * dt; q.vx *= 0.96; q.vy = q.vy * 0.96 + (q.grav || 0) * dt; }
+    fx.parts = fx.parts.filter((q) => q.t < q.life);
+    for (const r of fx.rings) r.t += dt; fx.rings = fx.rings.filter((r) => r.t < 0.6);
+    for (const l of fx.loops) l.t += dt; fx.loops = fx.loops.filter((l) => l.t < 0.9);
+    for (const s of fx.snips) s.t += dt; fx.snips = fx.snips.filter((s) => s.t < 0.5);
+    for (const f of fx.flowers) f.t += dt;
+    for (const [k, v] of fx.hop) fx.hop.set(k, v + dt);
+    for (const b of S.buds) if (b.open) b.anim = Math.min(1, b.anim + dt * 2.4);
+    for (const c of S.cages) if (c.open) c.anim = Math.min(1, c.anim + dt * 2);
+    for (const l of S.lanterns) if (l.lit) l.k = Math.min(1, (l.k || 0) + dt * 2.4); else l.k = 0;
+    if (S.gate.open) S.gate.anim = Math.min(1, S.gate.anim + dt * 2);
+    for (const d of S.doors) if (d.open) d.anim = Math.min(1, d.anim + dt * 2.5);
+    if (shake > 0) shake = Math.max(0, shake - dt * 30);
+    if (fx.flash > 0) fx.flash = Math.max(0, fx.flash - dt * 1.6);
+    if (fx.hpFlash > 0) fx.hpFlash = Math.max(0, fx.hpFlash - dt);
+    for (const w of fx.waves) w.t += dt; fx.waves = fx.waves.filter((w) => w.t < 0.7);
+    for (const c of fx.combos) c.t += dt; fx.combos = fx.combos.filter((c) => c.t < 1.6);
+    for (const e of S.enemies) if (!e.alive && e.pop > 0) e.popT = (e.popT || 0) + dt;
+    // ambient weather drifts around the camera
+    const amb = themeOf(S).amb, vw = W / cam.z, vh = H / cam.z;
+    for (const a of fx.amb) {
+      a.r += dt * a.v;
+      if (amb === 'snow') { a.y += 28 * a.v * dt; a.x += Math.sin(a.r) * 10 * dt; }
+      else if (amb === 'leaf' || amb === 'petal') { a.y += 22 * a.v * dt; a.x += (14 + Math.sin(a.r) * 18) * dt; }
+      else { a.x += Math.cos(a.r * 0.7) * 12 * dt; a.y += Math.sin(a.r * 0.9) * 10 * dt; }
+      if (a.x < cam.x - vw / 2 - 30) a.x += vw + 60; if (a.x > cam.x + vw / 2 + 30) a.x -= vw + 60;
+      if (a.y < cam.y - vh / 2 - 30) a.y += vh + 60; if (a.y > cam.y + vh / 2 + 30) a.y -= vh + 60;
+    }
+  }
+  const hadMoved = () => S.trail.length > 2 || S.loops > 0 || S.player.moving > 20;
+  function updateCam(dt) {
+    const p = S.player, z = zoom();
+    cam.z = z;
+    const vw = W / z, vh = H / z;
+    const intro = fx.intro > 0 && S.t < fx.intro && !hadMoved();
+    let tx = p.x + p.vx * 0.25, ty = p.y + p.vy * 0.25 - vh * 0.14;
+    if (intro || (fx.intro > 0 && S.t === 0)) { tx = S.gate.x + S.gate.w / 2; ty = S.gate.y + 40; }
+    const hud = 100 / z;
+    tx = S.W <= vw ? S.W / 2 : clamp(tx, vw / 2 - 40, S.W - vw / 2 + 40);
+    ty = S.H + hud <= vh ? S.H / 2 - hud / 2 : clamp(ty, vh / 2 - 40 - hud, S.H - vh / 2 + 24);
+    const k = 1 - Math.exp(-dt / (RM() ? 0.4 : intro || S.t < fx.intro + 1.2 ? 0.45 : 0.22));
+    cam.x += (tx - cam.x) * k; cam.y += (ty - cam.y) * k;
+  }
+
+  // ---------- world drawing ----------
+  function toScreen(x, y) { return { x: (x - cam.x) * cam.z + W / 2, y: (y - cam.y) * cam.z + H / 2 }; }
+  function drawWorld() {
+    const th = themeOf(S), t = S.t, rm = RM();
+    cam.z = zoom();
+    ctx.save();
+    const sx = shake ? (Math.random() - 0.5) * shake : 0, sy = shake ? (Math.random() - 0.5) * shake : 0;
+    ctx.translate(W / 2 + sx, H / 2 + sy); ctx.scale(cam.z, cam.z); ctx.translate(-cam.x, -cam.y);
+    // outside = deep hedge
+    ctx.fillStyle = th.outside; ctx.fillRect(-2000, -2000, S.W + 4000, S.H + 4000);
+    ctx.fillStyle = 'rgba(42,35,64,0.12)';
+    for (let x = -40; x < S.W + 80; x += 46) for (const y of [-26, S.H + 26]) { ctx.beginPath(); ctx.arc(x, y, 30, 0, TAU); ctx.fill(); }
+    // meadow
+    ctx.fillStyle = th.grass; A.rr(ctx, 0, 0, S.W, S.H, 28); ctx.fill();
+    const vx0 = cam.x - W / cam.z / 2 - 40, vx1 = cam.x + W / cam.z / 2 + 40, vy0 = cam.y - H / cam.z / 2 - 40, vy1 = cam.y + H / cam.z / 2 + 40;
+    for (const d of fx.decor) if (d.x > vx0 && d.x < vx1 && d.y > vy0 && d.y < vy1) A.drawScenery(ctx, d, th, t, rm);
+    // arena: where a grump is about to appear
+    for (const w of S.warns || []) {
+      const k = clamp(1 - w.t / 0.9, 0, 1);
+      ctx.fillStyle = `rgba(42,35,64,${0.12 + 0.25 * k})`; ctx.beginPath(); ctx.ellipse(w.x, w.y + 10, 10 + 18 * k, (10 + 18 * k) * 0.4, 0, 0, TAU); ctx.fill();
+      if (!rm) for (let q = 0; q < 3; q++) { const a = t * 8 + q * 2.1; ctx.fillStyle = 'rgba(140,127,153,0.7)'; ctx.beginPath(); ctx.arc(w.x + Math.cos(a) * 18 * k, w.y + 6 + Math.sin(a) * 6, 3, 0, TAU); ctx.fill(); }
+    }
+    // water
+    for (const w of S.water) {
+      ctx.fillStyle = C.waterDeep; A.rr(ctx, w.x, w.y, w.w, w.h, 14); ctx.fill();
+      ctx.fillStyle = C.water; A.rr(ctx, w.x, w.y + 8, w.w, w.h - 16, 12); ctx.fill();
+      ctx.strokeStyle = C.waterLight; ctx.lineWidth = 3; ctx.lineCap = 'round';
+      for (let x = w.x + 30; x < w.x + w.w - 20; x += 70) { const yy = w.y + w.h / 2 + Math.sin(x * 0.05) * 18, o = rm ? 0 : Math.sin(t * 2 + x) * 6; ctx.beginPath(); ctx.moveTo(x + o, yy); ctx.quadraticCurveTo(x + o + 10, yy - 5, x + o + 20, yy); ctx.stroke(); }
+      if (w.bridged && w.bridge) {
+        const b = S.buds.find((q) => q.water === w.id), k = b ? clamp(b.anim, 0, 1) : 1;
+        const x1 = w.bridge.x1, x2 = w.bridge.x2;
+        const n = 3;
+        for (let i = 0; i < n; i++) {
+          const kk = clamp(k * n - (n - 1 - i), 0, 1); if (kk <= 0) continue;
+          const cx = (x1 + x2) / 2 + (i % 2 ? 12 : -12), cy = w.y + 20 + (i * (w.h - 40)) / (n - 1), s = easeOutBack(kk);
+          const pad = new Path2D(); pad.ellipse(0, 0, 44, 26, 0, 0.25, TAU - 0.25); pad.lineTo(0, 0); pad.closePath();
+          ctx.save(); ctx.translate(cx, cy); ctx.scale(s, s); A.paperBody(ctx, pad, '#7ED36A', '#55A845', 3, -3, -3, true); ctx.restore();
+        }
+      }
+    }
+    // permanent flowers where grumps popped
+    for (const f of fx.flowers) { if (f.t < 0) continue; const k = rm ? 1 : easeOutBack(clamp(f.t / 0.35, 0, 1)); A.drawFlower(ctx, f.x, f.y, f.h, f.s * k); }
+    // thorns
+    for (const R of S.thorns) drawThorns(R);
+    // ribbon trail
+    drawTrail();
+    // loop flashes
+    for (const l of fx.loops) {
+      const k = l.t / 0.9;
+      ctx.save(); ctx.globalAlpha = (1 - k) * (l.caught ? 0.55 : 0.25);
+      ctx.beginPath(); l.poly.forEach((q, i) => (i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y))); ctx.closePath();
+      ctx.fillStyle = l.caught ? '#FFF3B0' : '#FFFFFF'; ctx.fill();
+      ctx.globalAlpha = 1 - k; ctx.lineWidth = 6 + k * 10; ctx.strokeStyle = C.gold; ctx.lineJoin = 'round'; ctx.stroke();
+      ctx.restore();
+    }
+    // hedges
+    for (const R of S.walls) drawHedge(R, th);
+    // doors (lock)
+    for (const d of S.doors) {
+      const k = d.anim;
+      if (k >= 1) continue;
+      ctx.save(); ctx.globalAlpha = 1 - k; ctx.translate(0, k * 20);
+      const p = A.rrPath(d.x, d.y, d.w, d.h, 8); A.paperBody(ctx, p, C.plank, C.plankShade, 3, -2, -3, true);
+      ctx.translate(d.x + d.w / 2, d.y + d.h / 2); A.drawLockGlyph(ctx, 14); ctx.translate(0, -34); ctx.globalAlpha = (1 - k) * 0.9;
+      ctx.beginPath(); ctx.arc(0, 0, 20, 0, TAU); ctx.fillStyle = '#FFF'; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = C.ink; ctx.stroke();
+      A.drawItem(ctx, d.lock, 0, 0, 0.8);
+      ctx.restore();
+    }
+    if (S.li >= 0) drawGate();
+    // y-sorted actors
+    const list = [];
+    for (const l of S.lanterns) list.push([l.y - 30, () => { ctx.save(); if (l.spent) { ctx.globalAlpha = 0.6; ctx.filter = 'grayscale(1)'; ctx.translate(l.x, l.y); ctx.rotate(0.35); ctx.translate(-l.x, -l.y); } A.drawLantern(ctx, l, t, rm); ctx.restore(); }]);
+    for (const b of S.buds) list.push([b.y, () => { A.drawBud(ctx, b, t, rm); if (!b.open) pulseRing(b.x, b.y, 34); }]);
+    for (const c of S.cages) list.push([c.y + 20, () => A.drawCage(ctx, c, t, rm, () => {
+      if (c.who === 'bird') drawBird(c.x, c.y + (c.open ? -Math.min(1, c.anim) * 60 : 10), c.open);
+      else if (!c.open) A.drawChick(ctx, c.x, c.y + 18, 1.1, t, true);
+      if (!c.open) pulseRing(c.x, c.y, 44);
+    })]);
+    for (const it of S.items) if (!it.taken && !it.used) list.push([it.y, () => { A.shadow(ctx, it.x, it.y + 16, 14, 0.18); A.drawItem(ctx, it.kind, it.x, it.y - 4 + (rm ? 0 : Math.sin(t * 4) * 3), 1.2); if (!rm && (t * 1.2) % 2 < 0.25) { ctx.strokeStyle = '#FFF'; ctx.lineWidth = 2.5; ctx.lineCap = 'round'; const tw = 5; ctx.beginPath(); ctx.moveTo(it.x + 14 - tw, it.y - 18); ctx.lineTo(it.x + 14 + tw, it.y - 18); ctx.moveTo(it.x + 14, it.y - 18 - tw); ctx.lineTo(it.x + 14, it.y - 18 + tw); ctx.stroke(); } }]);
+    for (const n of S.npcs) list.push([n.y + 18, () => A.drawNpc(ctx, n, t, rm, fx.hop.has(n.x + ',' + n.y) ? fx.hop.get(n.x + ',' + n.y) : 9)]);
+    for (const f of S.followers) if (f.free !== false || f.on || f.home) list.push([f.y, () => { A.shadow(ctx, f.x, f.y + 2, 11, 0.18); A.drawChick(ctx, f.x, f.y + 2 - (f.on && !rm ? Math.abs(Math.sin(t * 12)) * 4 : 0), 1.1, t, f.scared > 0); }]);
+    for (const e of S.enemies) {
+      if (e.alive) list.push([e.y + e.r * 0.7, () => A.drawGrump(ctx, e, t, rm)]);
+      else if ((e.popT || 0) < 0.22 && !rm) list.push([e.y, () => { const k = (e.popT || 0) / 0.22; ctx.save(); ctx.globalAlpha = 1 - k; ctx.translate(e.x, e.y); ctx.scale(1 + k * 0.6, 1 - k * 0.3); ctx.translate(-e.x, -e.y); A.drawGrump(ctx, Object.assign({}, e, { alive: true, kind: 'sleepy' }), t, true); ctx.restore(); }]);
+    }
+    for (const s of S.sparkles) if (!s.got) list.push([s.y + 20, () => A.drawStarSeed(ctx, s, t, rm)]);
+    list.push([S.player.y + 12, drawPlayer]);
+    list.sort((a, b) => a[0] - b[0]);
+    for (const [, f] of list) f();
+    // snips
+    for (const s of fx.snips) { ctx.save(); ctx.globalAlpha = 1 - s.t / 0.5; ctx.translate(s.x, s.y - 30 - s.t * 30); ctx.strokeStyle = C.ink; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-10, -10); ctx.lineTo(10, 10); ctx.moveTo(10, -10); ctx.lineTo(-10, 10); ctx.stroke(); ctx.restore(); }
+    // rings & particles
+    for (const r of fx.rings) { const k = r.t / 0.6; ctx.globalAlpha = 1 - k; ctx.strokeStyle = r.col; ctx.lineWidth = 4 * (1 - k) + 1; ctx.beginPath(); ctx.arc(r.x, r.y, 10 + k * 40, 0, TAU); ctx.stroke(); ctx.globalAlpha = 1; }
+    for (const q of fx.parts) {
+      if (q.t < 0) continue;
+      const k = q.t / q.life;
+      if (q.kind === 'heart') { ctx.globalAlpha = 1 - k; A.drawHeart(ctx, q.x + Math.sin(q.t * 6 + q.ph) * 6, q.y, 1 + k * 0.4); ctx.globalAlpha = 1; continue; }
+      ctx.globalAlpha = 1 - k; ctx.fillStyle = q.col; ctx.beginPath(); ctx.arc(q.x, q.y, q.size * (1 - k * 0.6), 0, TAU); ctx.fill(); ctx.globalAlpha = 1;
+    }
+    for (const w of fx.waves) { const k = w.t / 0.7; ctx.globalAlpha = 1 - k; ctx.strokeStyle = '#FFF6C9'; ctx.lineWidth = 10 * (1 - k) + 2; ctx.beginPath(); ctx.arc(w.x, w.y, w.r * (0.3 + k * 1.1), 0, TAU); ctx.stroke(); ctx.globalAlpha = 1; }
+    for (const c of fx.combos) drawCombo(c);
+    if (themeOf(S).amb && !rm) for (const a of fx.amb) A.drawAmbient(ctx, a, themeOf(S).amb);
+    drawCloseHere();
+    drawHint();
+    ctx.restore();
+    if (fx.flash > 0) { ctx.fillStyle = `rgba(255,248,214,${fx.flash * 0.6})`; ctx.fillRect(0, 0, W, H); }
+    if (fx.hpFlash > 0) { ctx.fillStyle = `rgba(184,178,196,${fx.hpFlash * 0.5})`; ctx.fillRect(0, 0, W, H); }
+        if (fx.restartT > 0) {
+      // out of hearts: a broken heart, then the room starts over
+      const k = clamp(1 - fx.restartT / 1.6, 0, 1);
+      ctx.fillStyle = `rgba(42,35,64,${Math.min(0.7, k * 1.6)})`; ctx.fillRect(0, 0, W, H);
+      const cx = W / 2, cy = H / 2 - 20, sp = RM() ? 0 : easeOutBack(clamp(k / 0.3, 0, 1)), split = clamp((k - 0.3) / 0.25, 0, 1) * 14;
+      for (const sd of [-1, 1]) {
+        ctx.save(); ctx.translate(cx + sd * split, cy + split * 0.5); ctx.rotate(sd * split * 0.02); ctx.scale(3 * (sp || 1), 3 * (sp || 1));
+        ctx.beginPath(); ctx.rect(sd < 0 ? -20 : 0, -20, 20, 40); ctx.clip();
+        A.drawItem(ctx, 'heart', 0, 0, 1); ctx.restore();
+      }
+      if (k > 0.55) { if (fx.keep) { ctx.save(); ctx.translate(cx, cy + 150); ctx.scale(1.4, 1.4); A.drawLantern(ctx, { x: 0, y: 0, lit: true, k: 1 }, rt, true); ctx.restore(); } else A.chip(ctx, cx, cy + 110, 36, 'restart', { primary: true, pulse: RM() ? 1 : 1 + Math.sin(rt * 8) * 0.05 }); }
+    }
+  }
+  // a combo crowns the loop with one flower per catch, rising in an arc
+  function drawCombo(c) {
+    const k = clamp(c.t / 1.6, 0, 1), rise = easeOutBack(clamp(c.t / 0.5, 0, 1));
+    ctx.save(); ctx.globalAlpha = k > 0.75 ? (1 - k) / 0.25 : 1;
+    const n = c.n, R = 40 + n * 10;
+    // golden burst behind the crown
+    ctx.save(); ctx.translate(c.x, c.y - 60 * rise - 30); ctx.rotate(c.t * 1.5); ctx.strokeStyle = C.rays; ctx.lineCap = 'round'; ctx.lineWidth = 8;
+    for (let i = 0; i < 12; i++) { ctx.rotate(TAU / 12); ctx.beginPath(); ctx.moveTo(0, -R * 0.5); ctx.lineTo(0, -R * (0.9 + 0.25 * (i % 2)) * rise); ctx.stroke(); }
+    ctx.restore();
+    for (let i = 0; i < n; i++) {
+      const a = -Math.PI / 2 + (i - (n - 1) / 2) * 0.42;
+      const x = c.x + Math.cos(a) * R, y = c.y - 60 * rise - 30 + Math.sin(a) * R * 0.6;
+      A.drawFlower(ctx, x, y, i, 2.2 * rise);
+    }
+    A.drawStar(ctx, c.x, c.y - 50 * rise - 30 - R * 0.9, 1.1 * rise);
+    ctx.font = '900 34px ui-rounded, system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineWidth = 6; ctx.strokeStyle = C.ink; ctx.fillStyle = C.gold;
+    const ty = c.y - 50 * rise - 30 - R * 0.9 - 40; ctx.strokeText('\u00d7' + n, c.x, ty); ctx.fillText('\u00d7' + n, c.x, ty); ctx.textAlign = 'start';
+    ctx.restore();
+  }
+  // when Pip nears an older stretch of ribbon, glow where touching it would close the loop
+  function drawCloseHere() {
+    const tr = S.trail, p = S.player;
+    if (tr.length < 12 || p.dead) return;
+    let back = 0, best = null, bd = 80;
+    for (let i = tr.length - 1; i > 0; i--) {
+      back += Math.hypot(tr[i].x - tr[i - 1].x, tr[i].y - tr[i - 1].y);
+      if (back < 200) continue;
+      const d = Math.hypot(tr[i].x - p.x, tr[i].y - p.y);
+      if (d < bd) { bd = d; best = tr[i]; }
+    }
+    if (!best) return;
+    const k = RM() ? 0.5 : 0.5 + 0.5 * Math.sin(S.t * 14);
+    ctx.fillStyle = `rgba(255,246,201,${0.5 + 0.4 * k})`; ctx.strokeStyle = C.gold; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(best.x, best.y, 10 + 4 * k, 0, TAU); ctx.fill(); ctx.stroke();
+  }
+  // "circle this": a slowly turning dotted ribbon ring, the same language as the ribbon itself
+  function pulseRing(x, y, r) {
+    ctx.save(); ctx.translate(x, y); if (!RM()) ctx.rotate(S.t * 0.8);
+    ctx.setLineDash([2, 11]); ctx.lineCap = 'round'; ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(255,200,61,0.8)';
+    ctx.beginPath(); ctx.arc(0, 0, r + 10, 0, TAU); ctx.stroke(); ctx.restore();
+  }
+  function drawBird(x, y, free) {
+    ctx.save(); ctx.translate(x, y);
+    const b = new Path2D(); b.ellipse(0, -8, 14, 12, 0, 0, TAU);
+    A.paperBody(ctx, b, C.npc, C.npcShade, 2.5, -2, -3, false);
+    const wing = (S ? S.t : rt) * (free ? 20 : 3);
+    for (const s of [-1, 1]) { const w = new Path2D(); w.ellipse(s * 14, -10, 9, 5, s * (0.3 + Math.sin(wing) * 0.5), 0, TAU); A.paperBody(ctx, w, C.npc, C.npcShade, 2, -1, -1, false); }
+    ctx.fillStyle = C.gold; ctx.strokeStyle = C.ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-3, -8); ctx.lineTo(3, -8); ctx.lineTo(0, -3); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = C.ink;
+    if (free) { ctx.lineWidth = 2; for (const s of [-1, 1]) { ctx.beginPath(); ctx.arc(s * 5, -12, 2.6, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke(); } }
+    else for (const s of [-1, 1]) { ctx.beginPath(); ctx.arc(s * 5, -12, 2, 0, TAU); ctx.fill(); }
+    ctx.restore();
+  }
+  const BRAMBLE = '#24391F', BRAMBLE_LIGHT = '#3F5E33';
+  function drawThorns(R) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(42,35,64,0.18)'; A.rr(ctx, R.x + 3, R.y + 5, R.w, R.h, 10); ctx.fill();
+    ctx.fillStyle = BRAMBLE; A.rr(ctx, R.x, R.y, R.w, R.h, 10); ctx.fill();
+    // sharp spikes all around (static: danger never wiggles)
+    const sp = 14;
+    ctx.fillStyle = BRAMBLE;
+    const spikes = (x0, y0, x1, y1, nx, ny) => {
+      const L = Math.hypot(x1 - x0, y1 - y0), n = Math.max(1, Math.round(L / sp));
+      for (let i = 0; i < n; i++) {
+        const a = i / n, b = (i + 1) / n, m = (a + b) / 2, h = 11 + ((i * 7) % 3) * 2;
+        ctx.beginPath(); ctx.moveTo(x0 + (x1 - x0) * a, y0 + (y1 - y0) * a); ctx.lineTo(x0 + (x1 - x0) * m + nx * h, y0 + (y1 - y0) * m + ny * h); ctx.lineTo(x0 + (x1 - x0) * b, y0 + (y1 - y0) * b); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = C.dangerEye; ctx.beginPath(); ctx.arc(x0 + (x1 - x0) * m + nx * (h - 2), y0 + (y1 - y0) * m + ny * (h - 2), 1.7, 0, TAU); ctx.fill(); ctx.fillStyle = BRAMBLE;
+      }
+    };
+    spikes(R.x + 4, R.y, R.x + R.w - 4, R.y, 0, -1); spikes(R.x + 4, R.y + R.h, R.x + R.w - 4, R.y + R.h, 0, 1);
+    spikes(R.x, R.y + 4, R.x, R.y + R.h - 4, -1, 0); spikes(R.x + R.w, R.y + 4, R.x + R.w, R.y + R.h - 4, 1, 0);
+    ctx.fillStyle = BRAMBLE_LIGHT;
+    for (let x = R.x + 12; x < R.x + R.w - 6; x += 22) for (let y = R.y + 10; y < R.y + R.h - 4; y += 18) { ctx.beginPath(); ctx.moveTo(x, y + 6); ctx.lineTo(x + 5, y - 4); ctx.lineTo(x + 9, y + 6); ctx.closePath(); ctx.fill(); }
+    ctx.restore();
+  }
+  // each world builds its walls from its own material: hedges, rocks, logs, snowbanks or old bricks
+  function drawHedge(R, th) {
+    const front = 14, kind = th.wall || 'hedge';
+    ctx.fillStyle = 'rgba(42,35,64,0.2)'; A.rr(ctx, R.x + 4, R.y + 8, R.w, R.h + 4, 12); ctx.fill();
+    ctx.fillStyle = th.hedgeShade; A.rr(ctx, R.x, R.y, R.w, R.h + 4, 12); ctx.fill();
+    ctx.fillStyle = th.hedge; A.rr(ctx, R.x, R.y - front * 0.4, R.w, R.h - 4, 12); ctx.fill();
+    ctx.save(); A.rr(ctx, R.x, R.y - front * 0.4, R.w, R.h - 4, 12); ctx.clip();
+    const seed = (R.x * 7 + R.y * 13) | 0;
+    if (kind === 'hedge') {
+      ctx.fillStyle = th.hedgeTop;
+      for (let x = R.x + 10; x <= R.x + R.w - 8; x += 20) for (let y = R.y + 4; y <= R.y + R.h - 14; y += 20) { ctx.beginPath(); ctx.arc(x, y, 9, 0, TAU); ctx.fill(); }
+    } else if (kind === 'rock') {
+      for (let x = R.x + 8, i = 0; x < R.x + R.w; x += 26, i++) for (let y = R.y + 2, j = 0; y < R.y + R.h - 6; y += 22, j++) {
+        const o = ((i * 31 + j * 17 + seed) % 7) - 3;
+        ctx.fillStyle = (i + j) % 2 ? th.hedgeTop : '#B7BFC4'; ctx.beginPath(); ctx.ellipse(x + 4 + o, y + 6, 13, 10, 0.3, 0, TAU); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.beginPath(); ctx.ellipse(x + o, y + 2, 5, 3, 0.3, 0, TAU); ctx.fill();
+      }
+    } else if (kind === 'log') {
+      const horiz = R.w >= R.h;
+      ctx.strokeStyle = th.hedgeShade; ctx.lineWidth = 2;
+      if (horiz) for (let y = R.y; y < R.y + R.h; y += 14) { ctx.beginPath(); ctx.moveTo(R.x, y); ctx.lineTo(R.x + R.w, y); ctx.stroke(); }
+      else for (let x = R.x; x < R.x + R.w; x += 14) { ctx.beginPath(); ctx.moveTo(x, R.y); ctx.lineTo(x, R.y + R.h); ctx.stroke(); }
+      ctx.fillStyle = th.hedgeTop;
+      for (const [ex, ey] of horiz ? [[R.x + 10, R.y + R.h / 2 - 4], [R.x + R.w - 10, R.y + R.h / 2 - 4]] : [[R.x + R.w / 2, R.y + 8], [R.x + R.w / 2, R.y + R.h - 14]]) {
+        ctx.beginPath(); ctx.arc(ex, ey, 9, 0, TAU); ctx.fill(); ctx.strokeStyle = th.hedgeShade; ctx.beginPath(); ctx.arc(ex, ey, 5, 0, TAU); ctx.stroke();
+      }
+    } else if (kind === 'snow') {
+      ctx.fillStyle = th.hedgeTop;
+      for (let x = R.x + 6; x <= R.x + R.w; x += 18) { ctx.beginPath(); ctx.arc(x, R.y - 2, 12, 0, TAU); ctx.fill(); }
+      ctx.fillRect(R.x, R.y - 2, R.w, Math.max(6, (R.h - 4) * 0.55));
+      ctx.fillStyle = '#CFE6F5';
+      for (let x = R.x + 12; x < R.x + R.w - 6; x += 30) { ctx.beginPath(); ctx.moveTo(x - 4, R.y + R.h - 10); ctx.lineTo(x + 4, R.y + R.h - 10); ctx.lineTo(x, R.y + R.h - 1); ctx.closePath(); ctx.fill(); }
+    } else if (kind === 'brick') {
+      for (let y = R.y - 6, r = 0; y < R.y + R.h; y += 12, r++) for (let x = R.x - (r % 2 ? 12 : 0); x < R.x + R.w; x += 24) {
+        ctx.fillStyle = (x + y + seed) % 3 ? th.hedgeTop : th.hedge; A.rr(ctx, x + 1, y + 1, 22, 10, 3); ctx.fill();
+      }
+    }
+    ctx.restore();
+    ctx.lineWidth = 3; ctx.strokeStyle = C.ink; A.rr(ctx, R.x, R.y - front * 0.4, R.w, R.h + 4 + front * 0.4, 12); ctx.stroke();
+  }
+  function drawGate() {
+    const g = S.gate, k = g.anim, t = S.t, rm = RM();
+    A.drawSunDoor(ctx, S.exit.x, S.exit.y + 30, g.open, k, t, rm);
+    // fence across the gap, sinks into the ground when all tasks are done
+    if (k < 1) {
+      ctx.save(); ctx.globalAlpha = 1 - k; ctx.translate(0, k * 18);
+      const posts = Math.max(3, Math.round(g.w / 22));
+      for (let i = 0; i <= posts; i++) { const x = g.x + (i * g.w) / posts; const p = A.rrPath(x - 5, g.y - 12, 10, g.h + 14, 5); A.paperBody(ctx, p, C.plank, C.plankShade, 2.5, -1, -2, true); }
+      for (const yy of [g.y + 2, g.y + g.h - 10]) { const p = A.rrPath(g.x - 6, yy, g.w + 12, 9, 4); A.paperBody(ctx, p, C.plank, C.plankShade, 2.5, -1, -2, false); }
+      ctx.restore();
+    }
+    // task board: one icon per task, ticks over as you go
+    const tasks = LG.tasks(S), n = tasks.length, sp = 40, cx = g.x + g.w / 2, by = g.y + g.h + 34;
+    if (k >= 1) return;
+    ctx.save(); ctx.globalAlpha = 1 - k;
+    const bw = n * sp + 12;
+    ctx.fillStyle = 'rgba(255,244,220,0.92)'; A.rr(ctx, cx - bw / 2, by - 22, bw, 44, 22); ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+    tasks.forEach((q, i) => {
+      const x = cx - ((n - 1) * sp) / 2 + i * sp, y = by;
+      if (q.done) { A.drawFlower(ctx, x, y, 0, 1.1); return; }
+      if (q.kind === 'enemy') { ctx.save(); ctx.translate(x, y); ctx.scale(0.62, 0.62); A.drawGrump(ctx, { x: 0, y: 0, r: q.sub === 'big' ? 26 : 21, kind: q.sub === 'sleepy' ? 'sleepy' : 'idle', alive: true, id: i, st: 'idle', vx: 0 }, 0, true); ctx.restore(); }
+      else if (q.kind === 'npc') { A.drawNpcIcon(ctx, q.sub, x, y + 10, 0.42, false); }
+      else if (q.kind === 'cage') { ctx.save(); ctx.translate(x, y); ctx.scale(0.45, 0.45); drawBird(0, 10, false); ctx.restore(); }
+    });
+    ctx.restore();
+  }
+  function drawTrail() {
+    const tr = S.trail; if (tr.length < 2) return;
+    const p = S.player;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const pts = tr.concat([{ x: p.x, y: p.y }]);
+    const n = pts.length;
+    // ink edge, gold body, white sparkle core; older part fades
+    const boosted = S.arena && S.arena.boost > 0;
+    for (const [w, col] of boosted ? [[17, C.ink], [12, C.gold], [5, '#FFFFFF']] : [[13, C.ink], [8, C.gold], [3, '#FFFBEA']]) {
+      for (let i = 1; i < n; i++) {
+        const a = 0.25 + 0.75 * (i / n);
+        ctx.globalAlpha = col === C.ink ? a * 0.8 : a;
+        ctx.strokeStyle = col; ctx.lineWidth = w;
+        ctx.beginPath(); ctx.moveTo(pts[i - 1].x, pts[i - 1].y); ctx.lineTo(pts[i].x, pts[i].y); ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+    // start point marker: "come back here to close the loop"
+    const s0 = pts[0];
+    if (!RM()) { const k = (S.t * 2) % 1; ctx.strokeStyle = `rgba(255,200,61,${1 - k})`; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(s0.x, s0.y, 6 + k * 14, 0, TAU); ctx.stroke(); }
+  }
+  function drawPlayer() {
+    const p = S.player, rm = RM();
+    if (p.dead > 0) {
+      const k = 1 - p.dead / LG.CONST.RESPAWN_TIME;
+      if (k < 0.3) { hv.flash = !rm && k < 0.12; A.drawHero(ctx, p.x, p.y + 12, heroPose(), rm); }
+      return;
+    }
+    A.drawHero(ctx, p.x, p.y + 12, heroPose(), rm);
+    if (p.carry) {
+      const bob = rm ? 0 : Math.sin(S.t * 5) * 2;
+      A.drawItem(ctx, p.carry.kind, p.x, p.y - 64 + bob, 1.05);
+    }
+  }
+  function heroPose() {
+    const p = S.player;
+    const h = { t: hv.t, st: hv.st, state: hv.state, phase: hv.phase, moving: p.moving, dir: hv.dir, squash: hv.sq.v, sproutA: hv.spr.v, blink: hv.t < hv.blinkUntil, flash: hv.flash, look: 0, hat: save.hat || 0 };
+    hv.flash = false;
+    if (p.inv > 0) h.alpha = RM() ? 0.6 : (Math.floor(S.t * 10) % 2 ? 0.4 : 1);
+    if (hv.state === 'idle' && S.t - S.lastProgress > 5) { const q = LG.hintTarget(S); if (q) h.look = clamp((q.x - p.x) / 200, -1, 1) * hv.dir; }
+    return h;
+  }
+  // ghost guidance: shows the next useful action, never performs it
+  function hintActive() {
+    if (S.li < 0 || S.won || S.player.dead || S.trail.length > 8) return false;
+    if (S.li === 0 && S.loops === 0 && S.t > 1.2) return true;
+    return S.t - S.lastProgress > LG.CONST.HINT_IDLE && S.idle > 1.2;
+  }
+  function drawHint() {
+    if (!hintActive()) return;
+    const q = LG.hintTarget(S); if (!q) return;
+    const p = S.player, t = S.t;
+    if (q.kind === 'loop') {
+      const R = (q.r || 20) + 62;
+      ctx.save(); ctx.setLineDash([3, 14]); ctx.lineCap = 'round'; ctx.lineWidth = 7; ctx.strokeStyle = 'rgba(255,200,61,0.75)';
+      const prog = RM() ? 1 : (t * 0.55) % 1.25;
+      ctx.beginPath(); ctx.arc(q.x, q.y, R, Math.PI / 2, Math.PI / 2 + TAU * Math.min(1, prog)); ctx.stroke();
+      ctx.setLineDash([]);
+      if (!RM() && prog < 1) {
+        const a = Math.PI / 2 + TAU * prog;
+        ctx.globalAlpha = 0.4; A.drawHero(ctx, q.x + Math.cos(a) * R, q.y + Math.sin(a) * R + 12, { t, st: 0, state: 'run', phase: t * 14, moving: 200, dir: Math.cos(a + Math.PI / 2) > 0 ? 1 : -1, squash: 1, sproutA: 0 }, true);
+      }
+      ctx.restore();
+    } else {
+      const dx = q.x - p.x, dy = q.y - p.y, L = Math.hypot(dx, dy);
+      if (L < 60) return;
+      ctx.save(); ctx.fillStyle = 'rgba(255,200,61,0.85)'; ctx.strokeStyle = C.ink; ctx.lineWidth = 2;
+      const off = RM() ? 0 : (t * 60) % 36;
+      for (let d = 40 + off; d < L - 30; d += 36) { ctx.beginPath(); ctx.arc(p.x + (dx / L) * d, p.y + (dy / L) * d, 5, 0, TAU); ctx.fill(); ctx.stroke(); }
+      ctx.restore();
+    }
+  }
+
+  // ---------- HUD & screens ----------
+  function drawHUD() {
+    const s = safe();
+    { const g = ctx.createLinearGradient(0, 0, 0, s.t + 100); g.addColorStop(0, 'rgba(255,244,220,0.55)'); g.addColorStop(1, 'rgba(255,244,220,0)'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, s.t + 100); }
+    if (S.li < 0) drawArenaHUD();
+    else {
+      for (let i = 0; i < 3; i++) A.drawStar(ctx, s.l + 30 + i * 40, s.t + 30, 0.95, !S.sparkles[i] || !S.sparkles[i].got);
+      const par = LG.LEVELS[S.li].par;
+      if (par) {
+        // the sun shrinks as time runs out; finish while it still shines for the sun medal
+        // the sun medal's ring drains like a clock; finish while any is left
+        const k = clamp(1 - (LG.clock ? LG.clock(S) : S.t) / par, 0, 1), x = s.l + 30 + 3 * 40 + 10, y = s.t + 30;
+        ctx.beginPath(); ctx.arc(x, y, 22, 0, TAU); ctx.fillStyle = 'rgba(255,244,220,0.9)'; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = C.ink; ctx.stroke();
+        if (k > 0) { ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, 20, -Math.PI / 2, -Math.PI / 2 + TAU * k); ctx.closePath(); ctx.fillStyle = k < 0.25 && !RM() && Math.floor(rt * 4) % 2 ? '#FF8A3D' : C.goldShade; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.ink; ctx.stroke(); }
+        drawSun(x, y, 0.62, k > 0);
+      }
+      // three hearts: lose them all and the room starts over
+      for (let i = 0; i < ROOM_HEARTS; i++) {
+        const on = i < ROOM_HEARTS - S.hurts;
+        ctx.save(); if (!on) ctx.globalAlpha = 0.28; A.drawItem(ctx, 'heart', s.l + 22 + i * 30, s.t + 70, 0.72); ctx.restore();
+      }
+    }
+    btn(W - s.r - 34, s.t + 34, 28, 'pause', () => setMode('pause'));
+    // arena: dark pointers at the screen edge for grumps you cannot see yet
+    if (S.li < 0) {
+      const threats = (S.warns || []).map((w) => ({ x: w.x, y: w.y, warn: true })).concat(S.enemies.filter((e) => e.alive));
+      const p = S.player;
+      threats.sort((a, b) => Math.hypot(a.x - p.x, a.y - p.y) - Math.hypot(b.x - p.x, b.y - p.y));
+      for (const q of threats.slice(0, 6)) {
+        const sc = toScreen(q.x, q.y), m = 30;
+        if (sc.x > 0 && sc.x < W && sc.y > 0 && sc.y < H) continue;
+        const ex = clamp(sc.x, m, W - m), ey = clamp(sc.y, m + 70, H - m), a = Math.atan2(sc.y - ey, sc.x - ex);
+        ctx.save(); ctx.translate(ex, ey); ctx.globalAlpha = q.warn && !RM() ? 0.5 + 0.5 * Math.abs(Math.sin(rt * 8)) : 0.95;
+        ctx.rotate(a); ctx.fillStyle = C.dangerEye; ctx.strokeStyle = C.ink; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.moveTo(26, 0); ctx.lineTo(13, -9); ctx.lineTo(13, 9); ctx.closePath(); ctx.fill(); ctx.stroke();
+        ctx.rotate(-a); ctx.scale(0.5, 0.5);
+        A.drawGrump(ctx, { x: 0, y: 0, r: 21, kind: 'wander', alive: true, id: 0, st: 'idle', vx: 0 }, 0, true);
+        ctx.restore();
+      }
+    }
+    // off-screen pointer: the open door always, otherwise the hinted target
+    {
+      const q = S.li >= 0 && S.gate.open ? { x: S.exit.x, y: S.exit.y } : hintActive() ? LG.hintTarget(S) : null;
+      if (q) {
+        const sc = toScreen(q.x, q.y), m = 48;
+        if (sc.x < 0 || sc.x > W || sc.y < 0 || sc.y > H) {
+          const ex = clamp(sc.x, m, W - m), ey = clamp(sc.y, m + 70, H - m), a = Math.atan2(sc.y - ey, sc.x - ex);
+          ctx.save(); ctx.translate(ex, ey);
+          ctx.beginPath(); ctx.arc(0, 0, 24, 0, TAU); ctx.fillStyle = C.cream; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+          ctx.rotate(a); ctx.fillStyle = C.gold; ctx.beginPath(); ctx.moveTo(34, 0); ctx.lineTo(22, -10); ctx.lineTo(22, 10); ctx.closePath(); ctx.fill(); ctx.stroke();
+          ctx.restore();
+        }
+      }
+    }
+    // floating joystick
+    if (joy.on) {
+      ctx.save(); ctx.globalAlpha = 0.5;
+      ctx.beginPath(); ctx.arc(joy.bx, joy.by, 58, 0, TAU); ctx.fillStyle = C.cream; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+      ctx.globalAlpha = 0.75; const dx = joy.x - joy.bx, dy = joy.y - joy.by, L = Math.hypot(dx, dy) || 1, k = Math.min(L, 46) / L;
+      ctx.beginPath(); ctx.arc(joy.bx + dx * k, joy.by + dy * k, 24, 0, TAU); ctx.fillStyle = 'rgba(255,244,220,0.35)'; ctx.fill(); ctx.lineWidth = 4; ctx.strokeStyle = C.ink; ctx.stroke();
+      ctx.restore();
+    }
+    // first-room coach: a hand drags in a circle (touch) / arrow keys (desktop)
+    if (S.li === 0 && !hadInput && S.loops === 0 && S.trail.length < 3 && S.t > 0.8) {
+      const cx = touchy ? W * 0.72 : W * 0.68, cy = H - Math.min(150, H * 0.2), a = S.t * 2.6, r = 34;
+      ctx.save(); ctx.globalAlpha = 0.45; ctx.beginPath(); ctx.arc(cx, cy, 58, 0, TAU); ctx.fillStyle = C.cream; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke(); ctx.restore();
+      ctx.beginPath(); ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 24, 0, TAU); ctx.fillStyle = C.hero; ctx.globalAlpha = 0.85; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke(); ctx.globalAlpha = 1;
+      A.drawHand(ctx, cx + Math.cos(a) * r + 10, cy + Math.sin(a) * r + 22, 1.2, 0.95);
+      if (!touchy) {
+        const kx = W * 0.3, ky = cy;
+        for (const [dx, dy, ang] of [[0, -44, -Math.PI / 2], [-44, 0, Math.PI], [0, 0, Math.PI / 2], [44, 0, 0]]) {
+          const lit = Math.floor(S.t * 2.6 / (Math.PI / 2)) % 4 === [[0, -44], [44, 0], [0, 0], [-44, 0]].findIndex((v) => v[0] === dx && v[1] === dy);
+          ctx.save(); ctx.translate(kx + dx, ky + dy); ctx.fillStyle = lit ? C.gold : C.cream; A.rr(ctx, -19, -19, 38, 38, 8); ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+          ctx.rotate(ang); ctx.fillStyle = C.ink; ctx.beginPath(); ctx.moveTo(9, 0); ctx.lineTo(-5, -8); ctx.lineTo(-5, 8); ctx.closePath(); ctx.fill(); ctx.restore();
+        }
+      }
+    }
+  }
+  function btn(x, y, r, glyph, act, o = {}) {
+    buttons.push({ x, y, r, act });
+    A.chip(ctx, x, y, r, glyph, Object.assign({ pressed: pressed && pressed.b.x === x && pressed.b.y === y }, o));
+  }
+  function dim(col) { ctx.fillStyle = col; ctx.fillRect(0, 0, W, H); }
+  function drawPause() {
+    dim('rgba(42,35,64,0.72)');
+    const cx = W / 2, cy = H / 2;
+    btn(cx, cy - 50, 50, 'play', () => setMode('play'), { primary: true, pulse: RM() ? 1 : 1 + Math.sin(rt * 6) * 0.03 });
+    const row = [['restart', () => startLevel(lastLevel)], [save.muted ? 'soundOff' : 'soundOn', () => setMuted(!save.muted)], [RM() ? 'motionOff' : 'motionOn', () => { save.rm = !RM(); persist(); }], ['levels', () => setMode('map')]];
+    const sp = Math.min(84, (W - 40) / row.length);
+    row.forEach(([g, f], i) => btn(cx + (i - (row.length - 1) / 2) * sp, cy + 70, 30, g, f));
+  }
+  // store-cover title plate (marketing only; the game itself stays wordless)
+  function drawCoverTitle() {
+    const s = Math.min(W / 520, H / 400) * 1.0, y = H * 0.14;
+    ctx.save(); ctx.translate(W / 2, y); ctx.scale(s, s);
+    ctx.font = '900 54px ui-rounded, "SF Pro Rounded", "Arial Rounded MT Bold", system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round'; ctx.lineWidth = 14; ctx.strokeStyle = C.ink; ctx.strokeText('Loop Garden', 0, 0);
+    ctx.lineWidth = 6; ctx.strokeStyle = '#FFFFFF'; ctx.strokeText('Loop Garden', 0, 0);
+    ctx.fillStyle = C.hero; ctx.fillText('Loop Garden', 0, 0);
+    ctx.restore();
+  }
+  function drawSun(x, y, sc, on) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(sc, sc);
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 8; i++) { ctx.rotate(TAU / 8); ctx.strokeStyle = on ? C.ink : 'rgba(42,35,64,0.3)'; ctx.lineWidth = 7; ctx.beginPath(); ctx.moveTo(0, -15); ctx.lineTo(0, -22); ctx.stroke(); ctx.strokeStyle = on ? C.rays : C.cream; ctx.lineWidth = 3.5; ctx.stroke(); }
+    ctx.beginPath(); ctx.arc(0, 0, 12, 0, TAU); ctx.fillStyle = on ? C.gold : 'rgba(255,244,220,0.85)'; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = on ? C.ink : 'rgba(42,35,64,0.35)'; ctx.stroke();
+    if (on) { ctx.fillStyle = C.ink; ctx.beginPath(); ctx.arc(-4, -2, 1.6, 0, TAU); ctx.arc(4, -2, 1.6, 0, TAU); ctx.fill(); ctx.lineWidth = 1.8; ctx.beginPath(); ctx.arc(0, 1, 4, 0.2 * Math.PI, 0.8 * Math.PI); ctx.stroke(); }
+    ctx.restore();
+  }
+  function drawWin() {
+    if (winT < 1.0) return; // let the celebration play in the world first
+    const a = clamp((winT - 1.0) / 0.4, 0, 1);
+    dim(`rgba(255,244,220,${0.88 * a})`);
+    const rm = RM(), sf = safe();
+    const last = lastLevel + 1 >= LG.LEVELS.length;
+    // composition is authored in a 440 x 520 box and scaled to fit between the safe edges and the button row
+    const btnY = H - sf.b - 56, boxH = 520, boxW = last ? 460 : 400;
+    const u = clamp(Math.min((W - sf.l - sf.r - 16) / boxW, (btnY - 50 - sf.t - 34) / boxH), 0.4, 1.15);
+    const cx = W / 2, top = sf.t + 34;
+    if (last) {
+      ctx.save(); ctx.globalAlpha = a * 0.85;
+      for (let i = 0; i < 60; i++) { const r = mulberry(i * 13 + 7), d = (winT - 1) * 1.2 - r() * 1.6; if (d <= 0) continue; A.drawFlower(ctx, r() * W, r() * H, i % 4, (rm ? 1.6 : 1.6 * easeOutBack(clamp(d, 0, 1)))); }
+      ctx.restore();
+    }
+    ctx.save(); ctx.globalAlpha = a; ctx.translate(cx, top); ctx.scale(u, u);
+    const got = LG.stars(S), hasPar = S.li >= 0 && LG.LEVELS[S.li].par;
+    const rowX = hasPar ? -40 : 0;
+    for (let i = 0; i < 3; i++) {
+      const tt = winT - 1.3 - i * 0.3, on = i < got && tt > 0, sc = on ? (rm ? 1 : easeOutBack(clamp(tt / 0.26, 0, 1))) : 1;
+      A.drawStar(ctx, rowX + (i - 1) * 70, 60 - (i === 1 ? 14 : 0), 1.6 * sc, !on);
+    }
+    if (hasPar) { const tt = winT - 2.2, on = fx.parWon && tt > 0; drawSun(rowX + 160, 56, on ? (rm ? 1.3 : 1.3 * easeOutBack(clamp(tt / 0.3, 0, 1))) : 1.1, on); }
+    ctx.save(); ctx.translate(0, 400); ctx.scale(2, 2);
+    const hatOn = fx.newHat > 0 && winT > 2.4;
+    A.drawHero(ctx, 0, 0, { t: winT, st: (winT - 1) % 1.6, state: 'celebrate', phase: 0, moving: 0, dir: 1, squash: 1, sproutA: 0, hat: hatOn || !(fx.newHat > 0) ? save.hat || 0 : 0 }, rm);
+    if (fx.newHat > 0 && winT > 1.8 && winT < 2.4) { const k = (winT - 1.8) / 0.6; ctx.save(); ctx.translate(0, -60 - (1 - k) * 60); ctx.globalAlpha = k; A.drawHat(ctx, fx.newHat); ctx.restore(); }
+    if (hatOn && winT < 3.2 && !rm) for (let q = 0; q < 6; q++) { const a = q + winT * 3; A.drawStar(ctx, Math.cos(a) * 34, -56 + Math.sin(a) * 18, 0.3); }
+    ctx.restore();
+    if (last) {
+      const fr = [['bunny', -175], ['frog', -100], ['bird', 100], ['hen', 175]];
+      fr.forEach(([who, dx], i) => {
+        const hop = rm ? 0 : Math.abs(Math.sin(winT * 5 + i)) * 8;
+        if (who === 'bird') { ctx.save(); ctx.translate(dx, 390 - hop); ctx.scale(1.6, 1.6); drawBird(0, 0, true); ctx.restore(); }
+        else A.drawNpcIcon(ctx, who, dx, 390 - hop, 0.9, true);
+        if (!rm) A.drawHeart(ctx, dx, 300 - ((winT * 30 + i * 20) % 50), 1);
+      });
+    }
+    ctx.restore();
+    if (winT > (rm ? 1.3 : 2.1)) {
+      const gap = Math.min(100, (W - 40) / 3);
+      btn(cx - gap, btnY, 30, 'restart', () => startLevel(lastLevel));
+      btn(cx, btnY, 42, last ? 'levels' : 'next', nextLevel, { primary: true, pulse: rm ? 1 : 1 + Math.sin(rt * 6) * 0.03 });
+      if (!last) btn(cx + gap, btnY, 30, 'levels', () => setMode('map'));
+    }
+    if (!rm && winT < 3.5) confetti(winT - 1);
+  }
+  function confetti(t) {
+    for (let i = 0; i < 40; i++) {
+      const r = mulberry(i * 7 + 3), x = r() * W, sp = 120 + r() * 160, y = (t * sp + r() * H) % (H + 40) - 20;
+      ctx.save(); ctx.translate(x + Math.sin(t * 3 + i) * 20, y); ctx.rotate(t * 4 + i); ctx.scale(1, Math.cos(t * 12 + i));
+      ctx.fillStyle = [C.gold, C.teal, C.bloom, C.hero, C.npc][i % 5]; ctx.fillRect(-3, -5, 6, 10); ctx.restore();
+    }
+  }
+  // arena result: your flower bouquet, a crown when it beats your best
+  function drawOver() {
+    const a = clamp(winT / 0.5, 0, 1), rm = RM(), sf = safe();
+    dim(`rgba(255,244,220,${0.9 * a})`);
+    const btnY = H - sf.b - 56, u = clamp(Math.min((W - 32) / 360, (btnY - 50 - sf.t) / 430), 0.45, 1.1), cx = W / 2;
+    ctx.save(); ctx.globalAlpha = a; ctx.translate(cx, sf.t + 10); ctx.scale(u, u);
+    const sc = S.arena.score, best = save.arenaBest || 0;
+    if (fx.newBest && winT > 0.6) drawCrown(0, 34, rm ? 1.2 : 1.2 * easeOutBack(clamp((winT - 0.6) / 0.3, 0, 1)));
+    scoreBadge(0, 100, sc, 1.6);
+    if (!fx.newBest) { ctx.save(); ctx.globalAlpha = a * 0.75; drawCrown(-58, 166, 0.55); scoreBadge(12, 166, best, 0.8); ctx.restore(); }
+    ctx.save(); ctx.translate(0, 400); ctx.scale(1.8, 1.8);
+    A.drawHero(ctx, 0, 0, { t: winT, st: winT % 1.6, state: fx.newBest ? 'celebrate' : 'idle', phase: 0, moving: 0, dir: 1, squash: 1, sproutA: 0 }, rm);
+    ctx.restore();
+    ctx.restore();
+    if (winT > (rm ? 0.4 : 1.2)) {
+      btn(cx - 60, btnY, 42, 'restart', () => breakThen(startArena), { primary: true, pulse: rm ? 1 : 1 + Math.sin(rt * 6) * 0.03 });
+      btn(cx + 60, btnY, 30, 'levels', () => setMode('map'));
+    }
+    if (fx.newBest && !rm && winT < 3) confetti(winT);
+  }
+  function drawCrown(x, y, s) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    const p = new Path2D('M-20 10 L-22 -10 L-10 0 L0 -16 L10 0 L22 -10 L20 10 Z');
+    ctx.lineJoin = 'round'; A.paperBody(ctx, p, C.gold, C.goldShade, 3, -2, -2, false);
+    for (const dx of [-22, 0, 22]) { ctx.beginPath(); ctx.arc(dx, dx ? -11 : -17, 3.5, 0, TAU); ctx.fillStyle = C.bloom; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.ink; ctx.stroke(); }
+    ctx.restore();
+  }
+  // optional numeric score (not needed to play): a flower followed by the count
+  function scoreBadge(x, y, n, s) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    const txt = String(n);
+    ctx.font = '800 26px ui-rounded, "SF Pro Rounded", system-ui, sans-serif'; ctx.textBaseline = 'middle';
+    const w = ctx.measureText(txt).width, bw = w + 58;
+    ctx.fillStyle = C.cream; A.rr(ctx, -bw / 2, -20, bw, 40, 20); ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+    A.drawFlower(ctx, -bw / 2 + 22, 0, 0, 1.25);
+    ctx.fillStyle = C.ink; ctx.fillText(txt, -bw / 2 + 42, 1);
+    ctx.restore();
+  }
+  function drawArenaHUD() {
+    const s = safe(), ar = S.arena;
+    for (let i = 0; i < ar.maxHp; i++) {
+      const on = i < ar.hp, x = s.l + 28 + i * 40, y = s.t + 30;
+      ctx.save(); if (!on) ctx.globalAlpha = 0.3; A.drawItem(ctx, 'heart', x, y + 2, on && ar.hp === 1 && !RM() ? 1.05 + Math.sin(rt * 10) * 0.08 : 1); ctx.restore();
+    }
+    scoreBadge(W < 400 ? W - s.r - 120 : W / 2, W < 400 ? s.t + 82 : s.t + 32, ar.score, W < 400 ? 0.85 : 1);
+    if (ar.boost > 0) { const x = s.l + 28, y = s.t + 78, k = ar.boost / 8; A.drawItem(ctx, 'spool', x, y, 0.8); ctx.beginPath(); ctx.arc(x, y, 22, -Math.PI / 2, -Math.PI / 2 + TAU * k); ctx.lineWidth = 4; ctx.strokeStyle = C.gold; ctx.stroke(); }
+  }
+  function mapIcon(ic, i, done) {
+    if (['bunny', 'frog', 'hen'].includes(ic)) A.drawNpcIcon(ctx, ic, 0, 12, 0.8, done);
+    else if (ic === 'bird') { ctx.save(); ctx.scale(1.6, 1.6); drawBird(0, 12, done); ctx.restore(); }
+    else if (ic === 'thorns') { ctx.save(); ctx.scale(0.9, 0.9); drawThorns({ x: -30, y: -6, w: 60, h: 22 }); ctx.restore(); }
+    else if (ic === 'arena') { ctx.save(); ctx.lineWidth = 7; ctx.strokeStyle = C.ink; ctx.beginPath(); ctx.ellipse(0, 12, 34, 22, 0, 0, TAU); ctx.stroke(); ctx.lineWidth = 4; ctx.strokeStyle = C.hero; ctx.stroke(); drawCrown(0, -10, 1.3); ctx.restore(); }
+    else if (ic === 'combo') {
+      ctx.save(); ctx.lineWidth = 7; ctx.strokeStyle = C.ink; ctx.beginPath(); ctx.ellipse(0, 4, 36, 26, 0, 0, TAU); ctx.stroke(); ctx.lineWidth = 4; ctx.strokeStyle = C.gold; ctx.stroke();
+      for (const [dx, dy] of [[-14, 8], [14, 8], [0, -6]]) { ctx.save(); ctx.translate(dx, dy); ctx.scale(0.45, 0.45); A.drawGrump(ctx, { x: 0, y: 0, r: 21, kind: ic === 'arena' ? 'wander' : 'sleepy', alive: true, id: dx, st: 'idle', vx: 0 }, rt, true); ctx.restore(); }
+      ctx.restore();
+    } else A.drawGrump(ctx, { x: 0, y: 4, r: ic === 'big' ? 28 : 22, kind: ic, alive: true, id: i, st: 'idle', vx: 0 }, rt, true);
+  }
+  function drawMap() {
+    const rm = RM();
+    ctx.fillStyle = '#A8DC78'; ctx.fillRect(0, 0, W, H);
+    const r0 = mulberry(5);
+    for (let i = 0; i < 70; i++) { const x = r0() * W, y = r0() * H; ctx.globalAlpha = 0.5; A.drawFlower(ctx, x, y, i % 4, 0.6); }
+    ctx.globalAlpha = 1;
+    // title emblem: Pip running a golden loop around a grump-turned-flower
+    const wide = W > H * 1.45;
+    const es = clamp(Math.min(W, H) / 700, 0.55, 0.9);
+    const tcx = wide ? Math.min(W * 0.18, 180) : W / 2, tcy = wide ? H / 2 : Math.min(96, H * 0.12) + 10;
+    ctx.save(); ctx.translate(tcx, tcy); ctx.scale(es, es);
+    ctx.lineCap = 'round'; ctx.lineWidth = 12; ctx.strokeStyle = C.ink; ctx.beginPath(); ctx.ellipse(0, 0, 92, 42, 0, 0, TAU); ctx.stroke();
+    ctx.lineWidth = 7; ctx.strokeStyle = C.gold; ctx.stroke();
+    A.drawFlower(ctx, 0, 0, 0, 2.2);
+    const a = rm ? 0.6 : rt * 1.4;
+    A.drawHero(ctx, Math.cos(a) * 92, Math.sin(a) * 42 + 12, { t: rt, st: 0, state: 'run', phase: rt * 14, moving: 200, dir: -Math.sin(a) > 0 ? 1 : -1, squash: 1, sproutA: 0.2, hat: save.hat || 0 }, rm);
+    ctx.restore();
+    // rooms along a snaking path, then the endless arena
+    const nL = LG.LEVELS.length, hasArena = !!LG.makeArena, n = nL + (hasArena ? 1 : 0);
+    mapTiles = []; if (mapFocus < 0) mapFocus = Math.min(save.unlocked, nL) - 1;
+    let cols = wide ? 5 : W > H * 1.1 ? 5 : W >= 300 ? 3 : 2;
+    if (!wide) { // short phones: widen the grid until each row has room for its tile and star row
+      const topGuess = tcy + 70 * es + 40, avail = H - topGuess - 84;
+      while (cols < 6 && avail / Math.ceil(n / cols) < 82 && (W - 24) / (cols + 1) >= 52) cols++;
+    }
+    const rows = Math.ceil(n / cols);
+    const left = wide ? tcx + 110 * es + 16 : 12, right = W - (wide ? 64 : 12);
+    let top = wide ? 60 : tcy + 70 * es + 40;
+    const availH = H - top - (wide ? 12 : 84);
+    const cellW = Math.min((right - left) / cols, 140), cellH = Math.min(availH / rows, 150);
+    const tile = Math.max(44, Math.min(92, cellW * 0.78, cellH - 34));
+    if (wide) top = Math.max(top, (H - rows * cellH) / 2 + 16);
+    const gx = (left + right) / 2 - (cols * cellW) / 2;
+    const pos = [];
+    for (let i = 0; i < n; i++) { const r = Math.floor(i / cols), c = r % 2 ? cols - 1 - (i % cols) : i % cols; pos.push({ x: gx + c * cellW + cellW / 2, y: top + r * cellH + cellH / 2 - 12 }); }
+    ctx.save(); ctx.setLineDash([2, 16]); ctx.lineCap = 'round'; ctx.lineWidth = 10; ctx.strokeStyle = 'rgba(255,244,220,0.9)';
+    ctx.beginPath(); pos.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y))); ctx.stroke(); ctx.restore();
+    const arenaOpen = save.unlocked >= ARENA_AFTER + 1;
+    pos.forEach((p, i) => {
+      const isArena = i === nL;
+      const locked = isArena ? !arenaOpen : i + 1 > save.unlocked, cur = !isArena && i + 1 === Math.min(save.unlocked, nL);
+      const tileAct = locked ? () => {} : isArena ? startArena : () => startLevel(i);
+      buttons.push({ x: p.x, y: p.y, r: tile / 2 + 4, act: tileAct }); mapTiles[i] = { x: p.x, y: p.y, act: tileAct };
+      if (mapFocus === i) { ctx.save(); ctx.lineWidth = 5; ctx.strokeStyle = C.hero; A.rr(ctx, p.x - tile / 2 - 7, p.y - tile / 2 - 7, tile + 14, tile + 14, 22); ctx.stroke(); ctx.restore(); }
+      const pr = pressed && pressed.b.x === p.x && pressed.b.y === p.y;
+      const th = isArena ? LG.THEMES[ARENA_THEME] : LG.THEMES[(LG.LEVELS[i].theme || 0) % LG.THEMES.length];
+      ctx.save(); ctx.translate(p.x, p.y + (pr ? 3 : 0));
+      ctx.fillStyle = 'rgba(42,35,64,0.25)'; A.rr(ctx, -tile / 2, -tile / 2 + 5, tile, tile, 18); ctx.fill();
+      ctx.fillStyle = locked ? '#CFC8D8' : isArena ? C.gold : th.light; A.rr(ctx, -tile / 2, -tile / 2, tile, tile, 18); ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+      if ((cur || (isArena && arenaOpen && (!save.arenaBest || save.unlocked > nL))) && !rm) { const k = (rt % 1.2) / 1.2; ctx.strokeStyle = `rgba(20,163,174,${1 - k})`; ctx.lineWidth = 4; A.rr(ctx, -tile / 2 - k * 10, -tile / 2 - k * 10, tile + k * 20, tile + k * 20, 18 + k * 6); ctx.stroke(); }
+      ctx.save(); ctx.scale(tile / 96, tile / 96);
+      if (locked) ctx.globalAlpha = 0.35;
+      const ic = isArena ? 'arena' : LG.LEVELS[i].icon || MAP_ICON[i] || 'sleepy';
+      mapIcon(ic, i, !isArena && save.unlocked > i + 1);
+      ctx.globalAlpha = 1;
+      if (locked) A.drawLockGlyph(ctx, 18);
+      ctx.restore();
+      ctx.restore();
+      if (isArena) { if (!locked && save.arenaBest) { drawCrown(p.x - 14, p.y + tile / 2 + 14, 0.45); ctx.save(); ctx.font = '800 15px ui-rounded, system-ui, sans-serif'; ctx.fillStyle = C.ink; ctx.textBaseline = 'middle'; ctx.fillText(String(save.arenaBest), p.x, p.y + tile / 2 + 16); ctx.restore(); } }
+      else if (!locked) {
+        { const ssp = Math.min(20, cellW / 3.1); for (let k = 0; k < 3; k++) A.drawStar(ctx, p.x + (k - 1) * ssp, p.y + tile / 2 + 14, 0.48 * Math.min(1, ssp / 20), k >= (save.stars[i] || 0)); }
+        if (save.par && save.par[i]) drawSun(p.x + tile / 2 - 6, p.y - tile / 2 + 6, 0.6, true);
+      }
+      if (cur) { ctx.save(); ctx.translate(p.x + tile / 2 - 4, p.y - tile / 2 + 18 + (rm ? 0 : -Math.abs(Math.sin(rt * 3.5)) * 5)); ctx.scale(0.62, 0.62); A.drawHero(ctx, 0, 0, { t: rt, st: 0, state: 'idle', phase: 0, moving: 0, dir: -1, squash: 1, sproutA: 0 }, rm); ctx.restore(); }
+    });
+    // wardrobe: total stars, and hats that the stars unlock (tap to wear the next one you own)
+    { const sf = safe(), tot = totalStars(), owned = HAT_COST.filter((c) => tot >= c).length;
+      const hx = sf.l + 36, hy = sf.t + 36;
+      buttons.push({ x: hx, y: hy, r: 30, act: () => { save.hat = ((save.hat || 0) + 1) % owned; persist(); } });
+      ctx.save(); ctx.beginPath(); ctx.arc(hx, hy, 30, 0, TAU); ctx.fillStyle = C.cream; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke(); ctx.clip();
+      A.drawHero(ctx, hx, hy + 44, { t: rt, st: 0, state: 'idle', phase: 0, moving: 0, dir: 1, squash: 1, sproutA: 0, hat: save.hat || 0 }, true); ctx.restore();
+      if (owned > 1 && !rm) { const k = (rt % 2) / 2; ctx.strokeStyle = `rgba(255,200,61,${1 - k})`; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(hx, hy, 30 + k * 10, 0, TAU); ctx.stroke(); }
+      // next hat to earn: its picture, a star and the count still needed
+      const next = HAT_COST.findIndex((c) => tot < c);
+      if (next > 0) {
+        const nx2 = hx - 6, ny2 = hy + 56;
+        ctx.save(); ctx.globalAlpha = 0.85; ctx.fillStyle = C.cream; A.rr(ctx, nx2 - 22, ny2 - 22, 92, 44, 22); ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = C.ink; ctx.stroke();
+        ctx.save(); ctx.translate(nx2, ny2 + 26); ctx.scale(0.7, 0.7); ctx.globalAlpha = 0.6; A.drawHat(ctx, next); ctx.restore();
+        A.drawStar(ctx, nx2 + 30, ny2, 0.5);
+        ctx.font = '800 16px ui-rounded, system-ui, sans-serif'; ctx.fillStyle = C.ink; ctx.textBaseline = 'middle'; ctx.fillText(String(tot) + '/' + HAT_COST[next], nx2 + 40, ny2 + 1);
+        ctx.restore();
+      }
+      btn(W - sf.r - 34, sf.t + 34, 28, save.muted ? 'soundOff' : 'soundOn', () => setMuted(!save.muted));
+      // continue: jump straight into the next unfinished room
+      const nx = Math.min(save.unlocked, nL) - 1, cxp = wide ? tcx : W - sf.r - 44, cyp = wide ? tcy + 90 * es + 50 : H - sf.b - 44;
+      btn(cxp, cyp, 34, 'play', () => startLevel(nx), { primary: true, pulse: rm ? 1 : 1 + Math.sin(rt * 5) * 0.04 }); }
+  }
+  function draw() {
+    buttons = [];
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    if (mode === 'map') { drawMap(); return; }
+    drawWorld();
+    if (COVER) { if (window.__coverTitle) drawCoverTitle(); return; }
+    if (mode === 'play') drawHUD();
+    else if (mode === 'pause') { drawHUD(); buttons = []; drawPause(); }
+    else if (mode === 'win') drawWin();
+    else if (mode === 'over') drawOver();
+  }
+
+  // debug/QA hook (read-only state + level jump)
+  window.__loopGarden = {
+    get state() { return S; }, get mode() { return mode; }, get size() { return [W, H, DPR, cam.z]; }, start: startLevel, arena: startArena, setMode, save: () => save,
+    // QA: advance the simulation deterministically with a fixed input vector
+    tick(sec, inp = {}) {
+      const m0 = mode; if (mode === 'pause' || mode === 'map') return;
+      for (let k = 0; k < Math.round(sec / DT); k++) simulate(DT, inp);
+      draw(); return m0;
+    },
+  };
+
+  // boot: a first-time player goes straight into the first room
+  if (save.unlocked <= 1 && !(save.stars[0] >= 0)) startLevel(0); else mode = 'map';
+  requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
