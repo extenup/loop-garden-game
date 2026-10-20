@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>relay</title>
+<script>
+(async () => {
+  const id = location.hash.slice(1);
+  try {
+    const meta = await (await fetch('https://api.github.com/gists/' + id)).json();
+    const f = Object.values(meta.files)[0];
+    const b64 = (await (await fetch(f.raw_url)).text()).trim();
+    const bin = atob(b64); const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    parent.postMessage({ ttvid: new Blob([u], { type: 'video/mp4' }), name: f.filename.replace(/\.b64$/, '') }, 'https://www.tiktok.com');
+  } catch (e) { parent.postMessage({ tterr: String(e) }, 'https://www.tiktok.com'); }
+})();
+</script>
