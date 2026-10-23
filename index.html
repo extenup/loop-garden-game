@@ -1210,7 +1210,10 @@
   const LG = G.LG || (G.LG = {});
   const target = G.LG_TARGET || 'standalone';
   const AD_GAP = 180; // seconds between breaks
+  // Playgama: first break after 90 s of play time, then at most one every 120 s (its config enforces the same)
+  const PG_FIRST = 90, PG_GAP = 120;
   const AD_TIMEOUT = 12000;
+  const REWARD_SAFETY = 90000; // a rewarded video that opened may run long; this only guards a stuck SDK
   let lastAd = 0, pending = null, prerollDone = false, playing = false;
   let onPause = () => {}, onResume = () => {}, onMute = () => {}, onRemote = () => {};
   let cg = null; // CrazyGames SDK once initialised
@@ -1280,7 +1283,7 @@
       if (target === 'pg') {
         // Playgama's own config also enforces delays; ads only between rooms
         const ad = pg && pg.advertisement;
-        if (!ad || kind === 'preroll' || ad.isInterstitialSupported === false || now - lastAd < AD_GAP) return Promise.resolve('skipped');
+        if (!ad || kind === 'preroll' || ad.isInterstitialSupported === false || now < (lastAd ? lastAd + PG_GAP : PG_FIRST)) return Promise.resolve('skipped');
         lastAd = now;
         return new Promise((resolve) => {
           pending = { resolve, timer: setTimeout(() => settle('timeout'), AD_TIMEOUT), opened: false };
@@ -1288,6 +1291,19 @@
         });
       }
       return Promise.resolve('unsupported');
+    },
+    // a rewarded video the player chose to watch (Playgama only); resolves 'rewarded' when the reward is earned
+    rewardedReady() {
+      const ad = target === 'pg' && pg && pg.advertisement;
+      return !!ad && !pending && ad.isRewardedSupported !== false && typeof ad.showRewarded === 'function';
+    },
+    showRewarded() {
+      if (!P.rewardedReady()) return Promise.resolve('unsupported');
+      return new Promise((resolve) => {
+        pending = { resolve, timer: setTimeout(() => settle('timeout'), AD_TIMEOUT), opened: false, rewarded: true, earned: false };
+        onPause();
+        try { pg.advertisement.showRewarded('revive'); } catch (e) { settle('error'); }
+      });
     },
   };
 
@@ -1333,12 +1349,24 @@
       const EV = b.EVENT_NAME || {};
       try {
         b.advertisement.on(EV.INTERSTITIAL_STATE_CHANGED, (state) => {
+          if (pending && pending.rewarded) return;
           const st = String(state).toLowerCase();
           if (st === 'loading' || st === 'opened') { if (pending && !pending.opened) { pending.opened = true; onPause(); } }
           else if (st === 'closed' || st === 'completed') settle('shown');
           else if (st === 'failed' || st === 'error') settle('unfilled');
         });
       } catch (e) { /* ads optional */ }
+      try {
+        b.advertisement.on(EV.REWARDED_STATE_CHANGED, (state) => {
+          const p = pending; if (!p || !p.rewarded) return;
+          const st = String(state).toLowerCase();
+          // loading may take a while; once the video is open it may run long, so only a safety net remains
+          if (st === 'loading') { clearTimeout(p.timer); p.timer = setTimeout(() => settle('timeout'), AD_TIMEOUT * 2); }
+          else if (st === 'opened') { p.opened = true; clearTimeout(p.timer); p.timer = setTimeout(() => settle(p.earned ? 'rewarded' : 'timeout'), REWARD_SAFETY); }
+          else if (st === 'rewarded') p.earned = true;
+          else if (st === 'closed' || st === 'failed' || st === 'error') { lastAd = performance.now() / 1000; settle(p.earned ? 'rewarded' : st === 'closed' ? 'closed' : 'unfilled'); }
+        });
+      } catch (e) { /* rewarded optional */ }
       try { if (b.platform.isAudioEnabled === false) onMute(true); b.platform.on && b.platform.on(EV.AUDIO_STATE_CHANGED, (on) => onMute(!on)); } catch (e) { /* optional */ }
       try { b.platform.on && b.platform.on(EV.PAUSE_STATE_CHANGED, (paused) => onMute(!!paused)); } catch (e) { /* optional */ }
       // bring in progress saved in the Playgama cloud
@@ -1915,6 +1943,12 @@
     next: (c, s) => { GLYPH.play(c, s * 0.9); c.beginPath(); c.moveTo(s * 0.85, -s * 0.65); c.lineTo(s * 0.85, s * 0.65); c.stroke(); },
     left: (c, s) => { c.beginPath(); c.moveTo(s * 0.35, -s * 0.7); c.lineTo(-s * 0.4, 0); c.lineTo(s * 0.35, s * 0.7); c.stroke(); },
     lock: (c, s) => drawLockGlyph(c, s),
+    // watch a short video for a reward: a little screen with a play mark, and the heart it gives back
+    adHeart: (c, s) => {
+      c.beginPath(); rr(c, -s * 0.95, -s * 0.72, s * 1.45, s * 1.1, s * 0.22); c.stroke();
+      c.beginPath(); c.moveTo(-s * 0.45, -s * 0.42); c.lineTo(s * 0.1, -s * 0.17); c.lineTo(-s * 0.45, s * 0.08); c.closePath(); c.fill();
+      drawHeart(c, s * 0.5, s * 0.45, s * 0.07);
+    },
     // effects on: a little burst; effects off: the same burst crossed out
     motionOn: (c, s) => { for (let i = 0; i < 8; i++) { const a = (i * TAU) / 8; c.beginPath(); c.moveTo(Math.cos(a) * s * 0.35, Math.sin(a) * s * 0.35); c.lineTo(Math.cos(a) * s * (i % 2 ? 0.6 : 0.85), Math.sin(a) * s * (i % 2 ? 0.6 : 0.85)); c.stroke(); } c.beginPath(); c.arc(0, 0, s * 0.16, 0, TAU); c.fill(); },
     motionOff: (c, s) => { c.save(); c.globalAlpha *= 0.45; GLYPH.motionOn(c, s); c.restore(); c.beginPath(); c.moveTo(-s * 0.8, s * 0.8); c.lineTo(s * 0.8, -s * 0.8); c.stroke(); },
@@ -1939,6 +1973,70 @@
     ctx.restore();
   }
   Object.assign(LG.art, { chip, GLYPH, drawHand });
+})(typeof window !== 'undefined' ? window : globalThis);
+
+;
+// In-app browsers (TikTok, Telegram, Instagram) show the game in a sheet that scrolls, pulls down
+// to close and swipes back. CSS touch-action is not enough there, so:
+//  - touches on the game canvas never pan, zoom or drag the page (real scroll areas still scroll);
+//  - one accidental "back" during play pauses the game instead of leaving (a second back leaves);
+//  - a Telegram Mini App is asked not to collapse on vertical swipes.
+// Same file in loop-garden/src and campfire-siege/src.
+(function (G) {
+  'use strict';
+  const NP = { passive: false };
+  const isGameCanvas = (el) => !!el && el.id === 'game';
+  // is there an element under the finger that can scroll in this direction?
+  function canScroll(el, dx, dy) {
+    for (; el && el.nodeType === 1 && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      const s = getComputedStyle(el);
+      // finger moving down scrolls towards the top, so it needs room above (and so on)
+      if (Math.abs(dy) >= Math.abs(dx) && /(auto|scroll)/.test(s.overflowY) && (dy > 0 ? el.scrollTop > 0 : el.scrollTop + el.clientHeight < el.scrollHeight - 1)) return true;
+      if (Math.abs(dx) > Math.abs(dy) && /(auto|scroll)/.test(s.overflowX) && (dx > 0 ? el.scrollLeft > 0 : el.scrollLeft + el.clientWidth < el.scrollWidth - 1)) return true;
+    }
+    return false;
+  }
+  let sx = 0, sy = 0;
+  document.addEventListener('touchstart', (e) => {
+    const t = e.touches[0]; if (t) { sx = t.clientX; sy = t.clientY; }
+    if (e.touches.length > 1 || isGameCanvas(e.target)) e.preventDefault();
+  }, NP);
+  document.addEventListener('touchmove', (e) => {
+    const t = e.touches[0];
+    if (e.touches.length > 1 || !t || isGameCanvas(e.target) || !canScroll(e.target, t.clientX - sx, t.clientY - sy)) e.preventDefault();
+  }, NP);
+  for (const ev of ['gesturestart', 'gesturechange', 'dblclick']) document.addEventListener(ev, (e) => e.preventDefault(), NP);
+
+  // one spare history entry while playing; "back" pops it and pauses instead of leaving the page
+  let armed = false, onBack = null;
+  function armBack(fn) {
+    onBack = fn;
+    if (armed) return;
+    try { history.pushState({ guard: 1 }, ''); armed = true; } catch (e) { /* sandboxed: no guard */ }
+  }
+  addEventListener('popstate', () => {
+    if (!armed) return;
+    armed = false; const f = onBack; onBack = null;
+    if (f) try { f(); } catch (e) { /* ignore */ }
+  });
+
+  // Telegram Mini App events (core.telegram.org/api/web-events), no remote script needed
+  function tgPost(type, data) {
+    const d = data || {};
+    try {
+      if (G.TelegramWebviewProxy && G.TelegramWebviewProxy.postEvent) G.TelegramWebviewProxy.postEvent(type, JSON.stringify(d));
+      else if (G.external && 'notify' in G.external) G.external.notify(JSON.stringify({ eventType: type, eventData: d }));
+      else if (G.parent !== G) G.parent.postMessage(JSON.stringify({ eventType: type, eventData: d }), '*');
+    } catch (e) { /* not in Telegram */ }
+  }
+  const inTelegram = /tgWebApp/.test(location.hash + location.search) || !!G.TelegramWebviewProxy;
+  if (inTelegram) {
+    tgPost('web_app_ready');
+    tgPost('web_app_expand');
+    tgPost('web_app_setup_swipe_behavior', { allow_vertical_swipe: false });
+  }
+
+  G.TouchGuard = { armBack, inTelegram };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 ;
@@ -1994,6 +2092,18 @@
   function firstGesture() { if (!prerollAsked) { prerollAsked = true; PF.showAd('preroll'); } }
   // a break at a natural pause; the next step runs once the break settles
   function breakThen(fn) { PF.showAd('break').then(fn); }
+  // out of hearts: watch a rewarded video to refill them once per attempt, otherwise the room restarts
+  function revive() {
+    if (!fx.offer) return;
+    fx.offer = false; fx.adBusy = true;
+    const room = S;
+    PF.showRewarded().then((r) => {
+      fx.adBusy = false;
+      if (S !== room) return;
+      if (r === 'rewarded') { S.revived = true; S.hurts = 0; fx.restartT = 0; SFX.heal(); hearts(S.player.x, S.player.y - 40); }
+      else fx.restartT = 0.01;
+    });
+  }
   function audioInit() {
     firstGesture();
     if (AU.ctx) { if (AU.ctx.state !== 'running' && !document.hidden) AU.ctx.resume().catch(() => {}); return; }
@@ -2086,7 +2196,10 @@
   let S = null, hv = null, fx = null, cam = { x: 0, y: 0, z: 1 };
   let winT = 0, hitStop = 0, shake = 0, hadInput = false, lastLevel = 0;
   const keys = new Set();
-  const joy = { on: false, id: null, bx: 0, by: 0, x: 0, y: 0 };
+  // the stick stays where it first appeared: touching near its resting spot reuses that centre
+  // joystick radius follows the screen: 15 % of the short side, 52–72 CSS px
+  const joyR = () => clamp(0.15 * Math.min(W, H), 52, 72);
+  const joy = { on: false, id: null, bx: 0, by: 0, x: 0, y: 0, hx: null, hy: null };
   let buttons = [], pressed = null, mapTiles = [], mapFocus = -1;
   const touchy = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
@@ -2100,7 +2213,7 @@
     startLevel(-1);
   }
   function startLevel(i) {
-    lastLevel = i; S = i < 0 ? LG.makeArena((Date.now() & 0xffff) + 1) : LG.makeState(i); mode = 'play'; winT = 0; hadInput = i !== 0;
+    lastLevel = i; S = i < 0 ? LG.makeArena((Date.now() & 0xffff) + 1) : LG.makeState(i); mode = 'play'; guardBack(); winT = 0; hadInput = i !== 0;
     song = SONGS[themeOf(S).music % SONGS.length]; songBoost = 0; AU.step = 0;
     hv = { phase: 0, squash: 1, sq: { v: 1, vel: 0 }, spr: { v: 0, vel: 0 }, dir: 1, blinkAt: 2, blinkUntil: 0, t: 0, st: 0, state: 'idle', stepAcc: 0 };
     fx = { parts: [], rings: [], loops: [], flowers: [], snips: [], hop: new Map(), budAnim: 0 };
@@ -2161,7 +2274,7 @@
           break;
         case 'bloom': sf(); burst(e.x, e.y, 14, C.bloom, 180, 0.8, 5); fx.rings.push({ x: e.x, y: e.y, t: 0, col: C.teal }); break;
         case 'free': SFX.bloom(); burst(e.x, e.y, 12, C.plank, 200, 0.6, 5); hearts(e.x, e.y - 30); break;
-        case 'hurt': if (S.li >= 0 && S.hurts >= ROOM_HEARTS && !(fx.restartT > 0)) { fx.restartT = 1.6; { const lt = S.lanterns.find((l) => l.lit && !l.spent); fx.keep = !!lt; if (lt) lt.spent = true; } SFX.over(); } sf(); shake = RM() ? 0 : 9; hitStop = RM() ? 0 : 0.08; burst(e.x, e.y - 10, 16, '#B8B2C4', 220, 0.55, 9); fx.rings.push({ x: e.x, y: e.y, t: 0, col: '#B8B2C4' }); hv.state = 'hurt'; break;
+        case 'hurt': if (S.li >= 0 && S.hurts >= ROOM_HEARTS && !(fx.restartT > 0)) { fx.restartT = 1.6; { const lt = S.lanterns.find((l) => l.lit && !l.spent); fx.keep = !!lt; if (lt) lt.spent = true; } fx.offer = !fx.keep && !S.revived && !!(PF.rewardedReady && PF.rewardedReady()); SFX.over(); } sf(); shake = RM() ? 0 : 9; hitStop = RM() ? 0 : 0.08; burst(e.x, e.y - 10, 16, '#B8B2C4', 220, 0.55, 9); fx.rings.push({ x: e.x, y: e.y, t: 0, col: '#B8B2C4' }); hv.state = 'hurt'; break;
         case 'spawn': sf(); fx.rings.push({ x: e.x, y: e.y, t: 0, col: C.bloom }); break;
         case 'snip': sf(); fx.snips.push({ x: e.x, y: e.y, t: 0 }); burst(e.x, e.y, 16, C.gold, 220, 0.6, 5); shake = RM() ? 0 : 3; break;
         case 'pick': sf(); fx.rings.push({ x: e.x, y: e.y, t: 0, col: C.teal }); break;
@@ -2186,7 +2299,7 @@
     if (keys.has('ArrowDown') || keys.has('KeyS')) my += 1;
     if (joy.on) {
       const dx = joy.x - joy.bx, dy = joy.y - joy.by, L = Math.hypot(dx, dy);
-      const dead = 6, full = 46;
+      const dead = 5, full = joyR() * 0.8;
       if (L > dead) { const k = clamp((L - dead) / (full - dead), 0, 1); mx = (dx / L) * k; my = (dy / L) * k; }
     }
     return { mx, my };
@@ -2200,17 +2313,17 @@
     if (mode === 'pause') { setMode('play'); return; }
     if (mode === 'win' && winT > 0.6 && winT < 2.1) { winT = 2.15; return; }
     if (mode === 'play' && !joy.on) {
-      joy.on = true; joy.id = e.pointerId; joy.bx = joy.x = x; joy.by = joy.y = y; hadInput = true;
+      const near = joy.hx != null && Math.hypot(x - joy.hx, y - joy.hy) <= joyR() + 30;
+      joy.on = true; joy.id = e.pointerId; joy.x = x; joy.y = y; hadInput = true;
+      joy.bx = joy.hx = near ? joy.hx : clamp(x, joyR() + 6, W - joyR() - 6);
+      joy.by = joy.hy = near ? joy.hy : clamp(y, joyR() + 6, H - joyR() - 6);
       try { cv.setPointerCapture(e.pointerId); } catch (er) { /* ignore */ }
     }
     e.preventDefault();
   });
   cv.addEventListener('pointermove', (e) => {
     if (joy.on && e.pointerId === joy.id) {
-      joy.x = e.clientX; joy.y = e.clientY;
-      // drag the base along so direction changes stay responsive
-      const dx = joy.x - joy.bx, dy = joy.y - joy.by, L = Math.hypot(dx, dy), max = 60;
-      if (L > max) { joy.bx = joy.x - (dx / L) * max; joy.by = joy.y - (dy / L) * max; }
+      joy.x = e.clientX; joy.y = e.clientY; // the base stays put; the knob is clamped when drawn
     }
   });
   function endPointer(e) {
@@ -2251,8 +2364,16 @@
     if (document.hidden) { keys.clear(); joy.on = false; if (mode === 'play' && !QA) setMode('pause'); if (AU.ctx) AU.ctx.suspend().catch(() => {}); }
     else if (AU.ctx) AU.ctx.resume().catch(() => {});
   });
-  function setMode(m) { mode = m; joy.on = false; keys.clear(); }
-  function nextLevel() { if (lastLevel + 1 < LG.LEVELS.length) { const n = lastLevel + 1; breakThen(() => startLevel(n)); } else setMode('map'); }
+  // an accidental back swipe in an in-app browser pauses play instead of leaving the page
+  function setMode(m) { mode = m; joy.on = false; keys.clear(); if (m === 'play') guardBack(); }
+  function guardBack() { if (window.TouchGuard) TouchGuard.armBack(() => { if (mode === 'play') setMode('pause'); }); }
+  function nextLevel() {
+    if (fx.leaving) return;
+    if (lastLevel + 1 < LG.LEVELS.length) { fx.leaving = true; const n = lastLevel + 1; breakThen(() => startLevel(n)); } else setMode('map');
+  }
+  // the win screen moves on by itself unless the player picks another button first
+  const winBtnT = () => (RM() ? 1.3 : 2.1);
+  const AUTO_NEXT = () => (lastLevel === 0 ? 2 : 3);
 
   // ---------- layout ----------
   function resize() {
@@ -2307,8 +2428,12 @@
       }
     }
     if (S.won && mode === 'play') { mode = 'win'; winT = 0; finishLevel(); }
-    if (fx.restartT > 0 && mode === 'play') { S.player.vx = S.player.vy = 0; fx.restartT -= dt; if (fx.restartT <= 0) { if (fx.keep) { fx.restartT = 0; S.hurts = 0; fx.keep = false; SFX.heal(); hearts(S.player.x, S.player.y - 40); } else { const keep = lastLevel; startLevel(keep); fx.intro = 0; return; } } }
+    if (fx.restartT > 0 && mode === 'play') { S.player.vx = S.player.vy = 0; fx.restartT -= dt;
+      // the player may watch a video to keep going: hold on the choice until they pick
+      if (fx.offer || fx.adBusy) fx.restartT = Math.max(fx.restartT, 0.5);
+      if (fx.restartT <= 0) { if (fx.keep) { fx.restartT = 0; S.hurts = 0; fx.keep = false; SFX.heal(); hearts(S.player.x, S.player.y - 40); } else { const keep = lastLevel; startLevel(keep); fx.intro = 0; return; } } }
     if (mode === 'win' || mode === 'over') winT += dt;
+    if (mode === 'win' && lastLevel + 1 < LG.LEVELS.length && winT > winBtnT() + AUTO_NEXT() && !pressed) nextLevel();
     if (S.li < 0 && S.arena && mode === 'play') songBoost = Math.max(songBoost, Math.min(30, S.arena.wave * 3));
     updateFx(dt);
     updateCam(dt);
@@ -2325,7 +2450,7 @@
     save.stars[i] = Math.max(save.stars[i] || 0, st);
     save.best[i] = Math.min(save.best[i] || 1e9, Math.round(LG.clock ? LG.clock(S) : S.t));
     save.unlocked = Math.max(save.unlocked, Math.min(LG.LEVELS.length, i + 2));
-    const after = totalStars(); fx.newHat = HAT_COST.findIndex((c, k) => k > 0 && before < c && after >= c);
+    const after = totalStars(); fx.starsBefore = before; fx.newHat = HAT_COST.findIndex((c, k) => k > 0 && before < c && after >= c);
     if (fx.newHat > 0) save.hat = fx.newHat;
     persist();
   }
@@ -2505,7 +2630,14 @@
         ctx.beginPath(); ctx.rect(sd < 0 ? -20 : 0, -20, 20, 40); ctx.clip();
         A.drawItem(ctx, 'heart', 0, 0, 1); ctx.restore();
       }
-      if (k > 0.55) { if (fx.keep) { ctx.save(); ctx.translate(cx, cy + 150); ctx.scale(1.4, 1.4); A.drawLantern(ctx, { x: 0, y: 0, lit: true, k: 1 }, rt, true); ctx.restore(); } else A.chip(ctx, cx, cy + 110, 36, 'restart', { primary: true, pulse: RM() ? 1 : 1 + Math.sin(rt * 8) * 0.05 }); }
+      if (k > 0.55) {
+        if (fx.keep) { ctx.save(); ctx.translate(cx, cy + 150); ctx.scale(1.4, 1.4); A.drawLantern(ctx, { x: 0, y: 0, lit: true, k: 1 }, rt, true); ctx.restore(); }
+        else if (fx.offer) {
+          // choice: a short video for full hearts right here, or start the room over
+          btn(cx - 64, cy + 120, 44, 'adHeart', revive, { primary: true, pulse: RM() ? 1 : 1 + Math.sin(rt * 6) * 0.05 });
+          btn(cx + 70, cy + 120, 32, 'restart', () => { fx.offer = false; fx.restartT = 0.01; });
+        } else if (!fx.adBusy) A.chip(ctx, cx, cy + 110, 36, 'restart', { primary: true, pulse: RM() ? 1 : 1 + Math.sin(rt * 8) * 0.05 });
+      }
     }
   }
   // a combo crowns the loop with one flower per catch, rising in an arc
@@ -2776,11 +2908,20 @@
         }
       }
     }
-    // floating joystick
+    // joystick: shown while held, and faintly at its resting spot between touches
+    if (!joy.on && joy.hx != null && touchy) {
+      if (joy.hx > W - joyR() || joy.hy > H - joyR()) joy.hx = joy.hy = null; // screen shrank
+      else {
+        ctx.save(); ctx.globalAlpha = 0.22;
+        ctx.beginPath(); ctx.arc(joy.hx, joy.hy, joyR(), 0, TAU); ctx.fillStyle = C.cream; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+        ctx.beginPath(); ctx.arc(joy.hx, joy.hy, 24, 0, TAU); ctx.lineWidth = 4; ctx.stroke();
+        ctx.restore();
+      }
+    }
     if (joy.on) {
       ctx.save(); ctx.globalAlpha = 0.5;
-      ctx.beginPath(); ctx.arc(joy.bx, joy.by, 58, 0, TAU); ctx.fillStyle = C.cream; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
-      ctx.globalAlpha = 0.75; const dx = joy.x - joy.bx, dy = joy.y - joy.by, L = Math.hypot(dx, dy) || 1, k = Math.min(L, 46) / L;
+      ctx.beginPath(); ctx.arc(joy.bx, joy.by, joyR(), 0, TAU); ctx.fillStyle = C.cream; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+      ctx.globalAlpha = 0.75; const dx = joy.x - joy.bx, dy = joy.y - joy.by, L = Math.hypot(dx, dy) || 1, k = Math.min(L, joyR() * 0.8) / L;
       ctx.beginPath(); ctx.arc(joy.bx + dx * k, joy.by + dy * k, 24, 0, TAU); ctx.fillStyle = 'rgba(255,244,220,0.35)'; ctx.fill(); ctx.lineWidth = 4; ctx.strokeStyle = C.ink; ctx.stroke();
       ctx.restore();
     }
@@ -2854,6 +2995,7 @@
       A.drawStar(ctx, rowX + (i - 1) * 70, 60 - (i === 1 ? 14 : 0), 1.6 * sc, !on);
     }
     if (hasPar) { const tt = winT - 2.2, on = fx.parWon && tt > 0; drawSun(rowX + 160, 56, on ? (rm ? 1.3 : 1.3 * easeOutBack(clamp(tt / 0.3, 0, 1))) : 1.1, on); }
+    hatGoal(0, 170, rm);
     ctx.save(); ctx.translate(0, 400); ctx.scale(2, 2);
     const hatOn = fx.newHat > 0 && winT > 2.4;
     A.drawHero(ctx, 0, 0, { t: winT, st: (winT - 1) % 1.6, state: 'celebrate', phase: 0, moving: 0, dir: 1, squash: 1, sproutA: 0, hat: hatOn || !(fx.newHat > 0) ? save.hat || 0 : 0 }, rm);
@@ -2870,13 +3012,38 @@
       });
     }
     ctx.restore();
-    if (winT > (rm ? 1.3 : 2.1)) {
+    if (winT > winBtnT()) {
       const gap = Math.min(100, (W - 40) / 3);
       btn(cx - gap, btnY, 30, 'restart', () => startLevel(lastLevel));
       btn(cx, btnY, 42, last ? 'levels' : 'next', nextLevel, { primary: true, pulse: rm ? 1 : 1 + Math.sin(rt * 6) * 0.03 });
       if (!last) btn(cx + gap, btnY, 30, 'levels', () => setMode('map'));
+      // countdown ring: the next room starts when it closes
+      if (!last) {
+        const k = clamp((winT - winBtnT()) / AUTO_NEXT(), 0, 1);
+        ctx.save(); ctx.lineCap = 'round'; ctx.lineWidth = 6; ctx.strokeStyle = C.ink; ctx.beginPath(); ctx.arc(cx, btnY, 52, -Math.PI / 2, -Math.PI / 2 + TAU * k); ctx.stroke();
+        ctx.lineWidth = 3; ctx.strokeStyle = C.gold; ctx.stroke(); ctx.restore();
+      }
     }
     if (!rm && winT < 3.5) confetti(winT - 1);
+  }
+  // the next hat to earn: its picture and a bar that fills with the stars just won
+  function hatGoal(x, y, rm) {
+    const after = totalStars(), next = HAT_COST.findIndex((c) => after < c);
+    if (next <= 0) return;
+    const lo = HAT_COST[next - 1], hi = HAT_COST[next], from = Math.max(lo, fx.starsBefore == null ? after : fx.starsBefore);
+    const k = rm ? 1 : clamp((winT - 1.6) / 0.8, 0, 1), v = from + (after - from) * k, f = clamp((v - lo) / (hi - lo), 0, 1);
+    // pill -140..140: hat, bar, star, count
+    const bx = x - 78, bw = 122;
+    ctx.save(); ctx.translate(0, y);
+    ctx.fillStyle = C.cream; A.rr(ctx, x - 140, -26, 280, 52, 26); ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = C.ink; ctx.stroke();
+    ctx.save(); ctx.translate(x - 106, 40); ctx.scale(0.85, 0.85); A.drawHat(ctx, next); ctx.restore();
+    ctx.fillStyle = 'rgba(42,35,64,0.15)'; A.rr(ctx, bx, -9, bw, 18, 9); ctx.fill();
+    if (f > 0) { ctx.fillStyle = C.gold; A.rr(ctx, bx, -9, Math.max(18, bw * f), 18, 9); ctx.fill(); }
+    ctx.lineWidth = 2.5; ctx.strokeStyle = C.ink; A.rr(ctx, bx, -9, bw, 18, 9); ctx.stroke();
+    A.drawStar(ctx, x + 62, 0, 0.5);
+    ctx.font = '800 17px ui-rounded, system-ui, sans-serif'; ctx.fillStyle = C.ink; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+    ctx.fillText(String(Math.round(v)) + '/' + hi, x + 76, 1);
+    ctx.restore();
   }
   function confetti(t) {
     for (let i = 0; i < 40; i++) {
